@@ -33,12 +33,13 @@ OPTIONS = {
             'Switch2 Bridge needs Bluetooth to connect to your controller.',
         'NSBluetoothPeripheralUsageDescription': 
             'Switch2 Bridge needs Bluetooth to connect to your controller.',
-        'NSAccessibilityUsageDescription': 
-            'Switch2 Bridge needs accessibility access to simulate keyboard input for games.',
+        'NSAccessibilityUsageDescription':
+            'Only the optional legacy keyboard bridge needs accessibility access. '
+            'The default DSU gamepad output does not.',
     },
     'packages': ['bleak', 'pynput', 'rumps', 'objc'],
     'includes': ['Foundation', 'AppKit', 'CoreBluetooth', 'ApplicationServices',
-                 'ServiceManagement', 'dsu_server'],
+                 'ServiceManagement', 'dsu_server', 'controller_state', 'controller_commands', 'outputs'],
 }
 
 setup(

@@ -3,8 +3,10 @@
 Switch2 Bridge - macOS Menubar App
 ==================================
 
-A clean menubar app to connect your Switch 2 Pro Controller
-and use it with Ryujinx (or any other emulator that reads the keyboard).
+A clean menubar app to connect your Switch 2 Pro Controller and expose it
+to emulators as a real analog gamepad over DSU (cemuhook) — no driver, no
+permissions. A legacy keyboard bridge is still available for emulators that
+read nothing but the keyboard, but it is off by default.
 
 Author: Aurélien Desert
 License: MIT
@@ -13,6 +15,7 @@ License: MIT
 import asyncio
 import json
 import logging
+import struct
 import subprocess
 import sys
 import threading
@@ -36,13 +39,6 @@ except ImportError:
     print("❌ bleak not installed — run: pip install bleak")
     sys.exit(1)
 
-try:
-    from pynput.keyboard import Controller, Key
-    keyboard = Controller()
-except ImportError:
-    print("❌ pynput not installed — run: pip install pynput")
-    sys.exit(1)
-
 AXIsProcessTrusted = None
 try:
     from ApplicationServices import AXIsProcessTrusted
@@ -52,7 +48,15 @@ except ImportError:
     except ImportError:
         pass
 
-from dsu_server import DSUServer
+from controller_state import (
+    BUTTON_NAMES,
+    ControllerState,
+    StickCalibration,
+    shape_stick,
+)
+import controller_commands as cc
+from dsu_server import ALIASABLE_BUTTONS, DSUServer
+from outputs import SPECIAL_KEY_NAMES, KeyboardOutput, pynput_available
 
 SMAppService = None
 try:
@@ -66,7 +70,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.2.3"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.4.1"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -109,8 +113,37 @@ class Mappings:
     A value of null (or "<none>") leaves that button unmapped.
     """
 
+    CONFIG_VERSION = 2
+
     DEFAULT = {
-        "version": 1,
+        "version": CONFIG_VERSION,
+        # The controller is exposed as a real analog gamepad over DSU. The
+        # keyboard bridge is legacy: it needs Accessibility and throws away
+        # analog precision, so it stays off unless explicitly enabled.
+        "dsu": {
+            "enabled": True,
+            "host": "127.0.0.1",
+            "port": 26760,
+            # DSU has no slot for the Switch 2-only buttons; fold them onto a
+            # DSU button here if you want them, e.g. "C": "HOME".
+            "aliases": {"GL": None, "GR": None, "C": None},
+        },
+        "keyboard": {"enabled": False},
+        "controller": {
+            # Which player LED to light once connected, one bit per LED
+            # (1 = player 1, 0x0F = all four, 0 = leave them alone)
+            "player_light": 1,
+        },
+        "motion": {
+            # The Switch 2 IMU layout is not confirmed. Run
+            # tools/capture_packets.py, then tools/analyze_capture.py to find
+            # the offsets for your firmware and set them here.
+            "enabled": False,
+            "accel_offset": None,
+            "gyro_offset": None,
+            "accel_scale": 1.0 / 4096.0,   # raw int16 -> g
+            "gyro_scale": 1.0 / 16.4,      # raw int16 -> deg/s
+        },
         "buttons": {
             "A": "z", "B": "x", "X": "c", "Y": "v",
             "L": "q", "R": "e", "ZL": "1", "ZR": "3",
@@ -121,43 +154,49 @@ class Mappings:
             "DLEFT": "<left>", "DRIGHT": "<right>",
         },
         "sticks": {
-            "threshold": 0.5,
+            "threshold": 0.5,       # keyboard bridge only
+            "deadzone": 0.08,       # radial, applied to the analog output
+            "saturation": 0.95,     # deflection treated as "fully pushed"
+            # The controller stores its own per-unit calibration in flash;
+            # reading it beats any constant. auto_center/half_range are the
+            # fallback for firmware that will not answer.
+            "calibration": {
+                "use_factory": True,
+                "auto_center": True,
+                "half_range": 1500,
+            },
             "left":  {"up": "w", "down": "s", "left": "a", "right": "d"},
             "right": {"up": "i", "down": "k", "left": "j", "right": "l"},
         },
-        "dsu": {
-            "enabled": True,
-            "host": "127.0.0.1",
-            "port": 26760,
-        },
     }
 
-    BUTTON_NAMES = frozenset(DEFAULT["buttons"])
+    BUTTON_NAMES = frozenset(BUTTON_NAMES)
     STICK_DIRECTIONS = frozenset(("up", "down", "left", "right"))
-
-    SPECIAL_KEYS = {
-        "<up>": Key.up, "<down>": Key.down,
-        "<left>": Key.left, "<right>": Key.right,
-        "<space>": Key.space, "<enter>": Key.enter,
-        "<esc>": Key.esc, "<tab>": Key.tab,
-        "<backspace>": Key.backspace, "<delete>": Key.delete,
-        "<home>": Key.home, "<end>": Key.end,
-        "<pageup>": Key.page_up, "<pagedown>": Key.page_down,
-        "<shift>": Key.shift, "<ctrl>": Key.ctrl,
-        "<alt>": Key.alt, "<cmd>": Key.cmd,
-    }
-    SPECIAL_KEYS.update({f"<f{i}>": getattr(Key, f"f{i}") for i in range(1, 21)})
+    DSU_ALIAS_TARGETS = frozenset(BUTTON_NAMES) - frozenset(ALIASABLE_BUTTONS)
 
     THRESHOLD_MIN, THRESHOLD_MAX = 0.1, 0.9
 
     def __init__(self):
         self.buttons = {}
         self.stick_threshold = 0.5
+        self.stick_deadzone = 0.08
+        self.stick_saturation = 0.95
+        self.stick_half_range = 1500
+        self.stick_auto_center = True
+        self.use_factory_calibration = True
+        self.player_light = 1
         self.left_stick = {}
         self.right_stick = {}
         self.dsu_enabled = True
         self.dsu_host = "127.0.0.1"
         self.dsu_port = 26760
+        self.dsu_aliases = {}
+        self.keyboard_enabled = False
+        self.motion_enabled = False
+        self.motion_accel_offset = None
+        self.motion_gyro_offset = None
+        self.motion_accel_scale = 1.0 / 4096.0
+        self.motion_gyro_scale = 1.0 / 16.4
         # Consumed by the UI tick: error → alert, warning → notification
         self.last_error = None
         self.last_warning = None
@@ -191,9 +230,13 @@ class Mappings:
             cfg = self.DEFAULT
             ok = False
 
+        migration_note = self._migrate(cfg) if ok else None
+
         try:
             self._apply(cfg)
             log.info("mappings loaded from %s", MAPPINGS_FILE)
+            if migration_note:
+                self.last_warning = migration_note
         except Exception as e:
             log.exception("invalid mappings.json")
             self.last_error = f"Invalid mappings.json: {e}\nUsing defaults."
@@ -202,6 +245,50 @@ class Mappings:
         return ok
 
     # --- internals ---
+
+    def _migrate(self, cfg):
+        """Add blocks introduced after the user's file was written.
+
+        Only ever *adds* missing keys — existing values are left alone, so a
+        hand-edited file survives an upgrade intact. Returns a note to show
+        the user when the migration changes how the app behaves.
+        """
+        if not isinstance(cfg, dict):
+            return None
+        was_v1 = int(cfg.get("version", 1) or 1) < 2
+        added = []
+        for block in ("dsu", "keyboard", "motion", "controller"):
+            if not isinstance(cfg.get(block), dict):
+                cfg[block] = dict(self.DEFAULT[block])
+                added.append(block)
+            else:
+                for key, value in self.DEFAULT[block].items():
+                    if key not in cfg[block]:
+                        cfg[block][key] = value
+        sticks = cfg.get("sticks")
+        if isinstance(sticks, dict):
+            for key in ("deadzone", "saturation", "calibration"):
+                sticks.setdefault(key, self.DEFAULT["sticks"][key])
+        if not added and not was_v1:
+            return None
+
+        cfg["version"] = self.CONFIG_VERSION
+        try:
+            with open(MAPPINGS_FILE, "w") as f:
+                json.dump(cfg, f, indent=2)
+            log.info("migrated mappings.json to v%d (added: %s)",
+                     self.CONFIG_VERSION, ", ".join(added) or "nothing")
+        except Exception:
+            log.exception("could not write migrated mappings.json")
+
+        if "keyboard" in added:
+            return (
+                "Updated config: the controller now works as a real analog "
+                "gamepad over DSU, and the keyboard bridge is off.\n"
+                "Re-enable it from the menubar (Keyboard bridge) if an "
+                "emulator of yours only reads the keyboard."
+            )
+        return None
 
     def _apply(self, cfg):
         buttons = cfg.get("buttons", {})
@@ -230,6 +317,41 @@ class Mappings:
         if clamped != threshold:
             warnings.append(f"Stick threshold {threshold} out of range, using {clamped}")
         self.stick_threshold = clamped
+
+        def number(block, key, default, lo, hi):
+            try:
+                value = float(block.get(key, default))
+            except (TypeError, ValueError):
+                raise ValueError(f'"sticks.{key}" must be a number')
+            bounded = min(max(value, lo), hi)
+            if bounded != value:
+                warnings.append(f"sticks.{key} {value} out of range, using {bounded}")
+            return bounded
+
+        self.stick_deadzone = number(sticks, "deadzone", 0.08, 0.0, 0.9)
+        self.stick_saturation = number(sticks, "saturation", 0.95, 0.1, 1.0)
+        if self.stick_saturation <= self.stick_deadzone:
+            warnings.append(
+                f"sticks.saturation ({self.stick_saturation}) must exceed "
+                f"deadzone ({self.stick_deadzone}); using defaults"
+            )
+            self.stick_deadzone, self.stick_saturation = 0.08, 0.95
+
+        calibration = sticks.get("calibration", {})
+        if not isinstance(calibration, dict):
+            raise ValueError('"sticks.calibration" must be an object')
+        self.stick_auto_center = bool(calibration.get("auto_center", True))
+        self.use_factory_calibration = bool(calibration.get("use_factory", True))
+        try:
+            half_range = int(calibration.get("half_range", 1500))
+        except (TypeError, ValueError):
+            raise ValueError('"sticks.calibration.half_range" must be an integer')
+        if not (200 <= half_range <= 2048):
+            warnings.append(
+                f"sticks.calibration.half_range {half_range} out of range, using 1500"
+            )
+            half_range = 1500
+        self.stick_half_range = half_range
 
         parsed_sticks = {}
         for side in ("left", "right"):
@@ -262,46 +384,138 @@ class Mappings:
             port = 26760
         self.dsu_port = port
 
+        aliases_cfg = dsu.get("aliases", {})
+        if not isinstance(aliases_cfg, dict):
+            raise ValueError('"dsu.aliases" must be an object')
+        aliases = {}
+        for source, target in aliases_cfg.items():
+            if target is None:
+                continue
+            if source not in ALIASABLE_BUTTONS:
+                warnings.append(
+                    f"dsu.aliases: {source} is not aliasable "
+                    f"(only {', '.join(ALIASABLE_BUTTONS)})"
+                )
+                continue
+            if target not in self.DSU_ALIAS_TARGETS:
+                warnings.append(f"dsu.aliases: unknown target button {target!r}")
+                continue
+            aliases[source] = target
+        self.dsu_aliases = aliases
+
+        controller = cfg.get("controller", {})
+        if not isinstance(controller, dict):
+            raise ValueError('"controller" must be an object')
+        try:
+            light = int(controller.get("player_light", 1))
+        except (TypeError, ValueError):
+            raise ValueError('"controller.player_light" must be an integer')
+        if not (0 <= light <= 0x0F):
+            warnings.append(
+                f"controller.player_light {light} out of range (0-15), using 1"
+            )
+            light = 1
+        self.player_light = light
+
+        keyboard_cfg = cfg.get("keyboard", {})
+        if not isinstance(keyboard_cfg, dict):
+            raise ValueError('"keyboard" must be an object')
+        self.keyboard_enabled = bool(keyboard_cfg.get("enabled", False))
+        if self.keyboard_enabled and not pynput_available():
+            warnings.append(
+                "Keyboard bridge is enabled but pynput is not installed; "
+                "install it or leave the bridge off and use DSU."
+            )
+
+        motion = cfg.get("motion", {})
+        if not isinstance(motion, dict):
+            raise ValueError('"motion" must be an object')
+        self.motion_accel_offset = self._parse_offset(motion, "accel_offset")
+        self.motion_gyro_offset = self._parse_offset(motion, "gyro_offset")
+        try:
+            self.motion_accel_scale = float(motion.get("accel_scale", 1.0 / 4096.0))
+            self.motion_gyro_scale = float(motion.get("gyro_scale", 1.0 / 16.4))
+        except (TypeError, ValueError):
+            raise ValueError('"motion.accel_scale"/"gyro_scale" must be numbers')
+        self.motion_enabled = bool(motion.get("enabled", False))
+        if self.motion_enabled and (
+            self.motion_accel_offset is None and self.motion_gyro_offset is None
+        ):
+            warnings.append(
+                "motion.enabled is set but no accel_offset/gyro_offset is "
+                "configured — motion will stay zeroed. Run "
+                "tools/capture_packets.py to find them."
+            )
+            self.motion_enabled = False
+
         if warnings:
             self.last_warning = "\n".join(warnings)
+
+    @staticmethod
+    def _parse_offset(block, key):
+        value = block.get(key)
+        if value is None:
+            return None
+        try:
+            offset = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f'"motion.{key}" must be an integer or null')
+        if offset < 0:
+            raise ValueError(f'"motion.{key}" must not be negative')
+        return offset
 
     def set_dsu_enabled(self, enabled):
         """Persist the DSU toggle back into mappings.json (best effort)."""
         self.dsu_enabled = bool(enabled)
+        self._persist_flag("dsu", "enabled", self.dsu_enabled)
+
+    def set_keyboard_enabled(self, enabled):
+        """Persist the keyboard-bridge toggle back into mappings.json."""
+        self.keyboard_enabled = bool(enabled)
+        self._persist_flag("keyboard", "enabled", self.keyboard_enabled)
+
+    @staticmethod
+    def _persist_flag(block, key, value):
         try:
-            self.ensure_default_file()
+            Mappings.ensure_default_file()
             with open(MAPPINGS_FILE) as f:
                 cfg = json.load(f)
         except Exception:
             # Never clobber a corrupt (but user-authored) file with defaults —
             # the toggle just won't persist until the file is fixed.
-            log.exception("mappings.json unreadable, DSU toggle not persisted")
+            log.exception("mappings.json unreadable, %s.%s not persisted", block, key)
             return
-        dsu = cfg.get("dsu")
-        if not isinstance(dsu, dict):
-            dsu = cfg["dsu"] = {}
-        dsu["enabled"] = self.dsu_enabled
+        section = cfg.get(block)
+        if not isinstance(section, dict):
+            section = cfg[block] = {}
+        section[key] = value
         try:
             with open(MAPPINGS_FILE, "w") as f:
                 json.dump(cfg, f, indent=2)
         except Exception:
-            log.exception("could not write mappings.json to persist DSU toggle")
+            log.exception("could not write mappings.json to persist %s.%s", block, key)
 
     @classmethod
     def _parse_key(cls, value):
+        """Validate a key and return it as a token the keyboard output resolves.
+
+        Tokens stay plain strings so mappings can be parsed and reported even
+        when pynput is absent — the keyboard bridge is optional now.
+        """
         if value is None or value == "<none>":
             return None
         if not isinstance(value, str):
             raise ValueError(f"key must be a string or null, got {type(value).__name__}")
-        if value in cls.SPECIAL_KEYS:
-            return cls.SPECIAL_KEYS[value]
+        if value in SPECIAL_KEY_NAMES:
+            return value
         if len(value) == 1:
             # "Z" would be typed as shift+z by pynput; games expect the bare keycode
             if value != value.lower():
                 log.info("normalizing key %r to %r", value, value.lower())
             return value.lower()
         raise ValueError(
-            f"unknown key {value!r} (use a single character, null, or one of {sorted(cls.SPECIAL_KEYS)})"
+            f"unknown key {value!r} (use a single character, null, or one of "
+            f"{sorted(SPECIAL_KEY_NAMES)})"
         )
 
 
@@ -310,11 +524,46 @@ class Mappings:
 # ============================================================
 
 class ControllerBridge:
-    """BLE connection + keyboard input simulation."""
+    """BLE connection + fan-out to the output backends.
 
-    def __init__(self, mappings: Mappings, dsu: DSUServer = None):
+    The BLE report is decoded exactly once into a ControllerState, which is
+    then handed to every enabled output. DSU is the real-gamepad path; the
+    keyboard bridge is optional and legacy.
+    """
+
+    # (byte offset, bit mask, button name)
+    _BUTTON_BITS = (
+        (2, 0x01, 'B'), (2, 0x02, 'A'), (2, 0x04, 'Y'), (2, 0x08, 'X'),
+        (2, 0x10, 'R'), (2, 0x20, 'ZR'), (2, 0x40, '+'), (2, 0x80, 'RS'),
+        (3, 0x01, 'DDOWN'), (3, 0x02, 'DRIGHT'), (3, 0x04, 'DLEFT'),
+        (3, 0x08, 'DUP'), (3, 0x10, 'L'), (3, 0x20, 'ZL'),
+        (3, 0x40, '-'), (3, 0x80, 'LS'),
+        # byte 4 is the Switch 2's own block. These assignments come from a
+        # timed capture (tools/capture_packets.py): each bit was held late in
+        # its own phase and bled into the next, and ZL/ZR served as a control
+        # for that lag. This corrects an earlier swap of C and CAPT.
+        (4, 0x01, 'HOME'), (4, 0x02, 'CAPT'), (4, 0x04, 'GR'),
+        (4, 0x08, 'GL'), (4, 0x10, 'C'),
+    )
+
+    MIN_REPORT_LEN = 11
+    # Upper bound on the whole configure step, so a controller that never
+    # answers costs us a moment rather than the connection
+    CONFIG_TIMEOUT = 3.0
+    # How many raw reports "Capture raw packets" writes to the log
+    RAW_CAPTURE_LIMIT = 300
+
+    def __init__(self, mappings: Mappings, dsu: DSUServer = None,
+                 keyboard_output=None):
         self.mappings = mappings
         self.dsu = dsu
+        self.keyboard = keyboard_output
+        self.last_state = None       # most recent ControllerState, for the UI
+        self._raw_remaining = 0      # >0 while a raw capture is running
+        self.calibration = StickCalibration(
+            half_range=mappings.stick_half_range,
+            auto_center=mappings.stick_auto_center,
+        )
         self.is_connected = False
         self.is_searching = False
         self.is_connecting = False
@@ -324,113 +573,139 @@ class ControllerBridge:
         # Set by worker, read & cleared by the main-thread UI tick
         self.last_error = None
         self.last_notice = None
-        # Key state: which key each input source holds, and how many sources
-        # hold each key (two buttons mapped to the same key must not release
-        # it while one of them is still down).
-        self._key_lock = threading.Lock()
-        self._source_keys = {}   # source name -> key currently held
-        self._key_refs = {}      # key -> number of sources holding it
         self._client = None
         self._stop_event = threading.Event()
         self._thread = None
         self._loop = None
         self._task = None
 
-    # --- key dispatch ---
-
-    def _press_ref(self, key):
-        n = self._key_refs.get(key, 0)
-        self._key_refs[key] = n + 1
-        if n == 0:
-            try:
-                keyboard.press(key)
-            except Exception as e:
-                log.warning("keyboard.press failed: %s", e)
-
-    def _release_ref(self, key):
-        n = self._key_refs.get(key, 0)
-        if n <= 1:
-            self._key_refs.pop(key, None)
-            try:
-                keyboard.release(key)
-            except Exception as e:
-                log.warning("keyboard.release failed: %s", e)
-        else:
-            self._key_refs[key] = n - 1
-
-    def _set_key(self, source, key, active):
-        """Press/release `key` on behalf of `source` (a button or stick direction)."""
-        with self._key_lock:
-            prev = self._source_keys.get(source)
-            if active and key is not None:
-                if prev == key:
-                    return
-                if prev is not None:
-                    self._release_ref(prev)
-                self._source_keys[source] = key
-                self._press_ref(key)
-            else:
-                if prev is None:
-                    return
-                del self._source_keys[source]
-                self._release_ref(prev)
+    # --- key dispatch (delegated to the optional keyboard backend) ---
 
     def release_all_keys(self):
-        with self._key_lock:
-            for key in list(self._key_refs):
-                try:
-                    keyboard.release(key)
-                except Exception as e:
-                    log.warning("keyboard.release on cleanup failed: %s", e)
-            self._key_refs.clear()
-            self._source_keys.clear()
+        if self.keyboard is not None:
+            self.keyboard.release_all()
 
-    def _set_stick_key(self, source, key, value):
-        """Threshold with hysteresis: press above t, release below 0.8*t.
+    # --- controller configuration (command channel) ---
 
-        Avoids key chatter when the stick hovers right at the threshold.
+    async def _configure_with_timeout(self, client):
+        try:
+            await asyncio.wait_for(
+                self._configure_controller(client), timeout=self.CONFIG_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            log.info("controller configuration timed out; using defaults")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("controller configuration failed")
+
+    async def _configure_controller(self, client):
+        """Read stick calibration from flash and light a player LED.
+
+        Best effort: a controller or firmware that does not answer simply
+        keeps the measured defaults, so a failure here never costs us the
+        connection.
         """
-        t = self.mappings.stick_threshold
-        held = source in self._source_keys
-        self._set_key(source, key, value > (t * 0.8 if held else t))
+        replies = asyncio.Queue()
+
+        def on_reply(_sender, payload):
+            replies.put_nowait(bytes(payload))
+
+        try:
+            await client.start_notify(cc.RESPONSE_CHAR, on_reply)
+        except Exception as e:
+            log.info("command channel unavailable (%s); using measured defaults", e)
+            return
+
+        async def spi_read(address, length):
+            while not replies.empty():
+                replies.get_nowait()
+            await client.write_gatt_char(
+                cc.COMMAND_CHAR, cc.spi_read_command(address, length),
+                response=False,
+            )
+            # The controller also streams input on other channels; only the
+            # reply that echoes our address counts.
+            for _attempt in range(3):
+                try:
+                    reply = await asyncio.wait_for(replies.get(), timeout=0.8)
+                except asyncio.TimeoutError:
+                    return None
+                parsed = cc.parse_spi_reply(reply)
+                if parsed and parsed[0] == address:
+                    return parsed[1]
+            return None
+
+        try:
+            left = cc.decode_stick_block(
+                await spi_read(cc.FACTORY_STICK_LEFT, cc.STICK_BLOCK_LEN)
+            )
+            right = cc.decode_stick_block(
+                await spi_read(cc.FACTORY_STICK_RIGHT, cc.STICK_BLOCK_LEN)
+            )
+            if self.mappings.use_factory_calibration:
+                if self.calibration.apply_factory(left, right):
+                    self.last_notice = "Stick calibration read from controller"
+                else:
+                    log.info("no usable factory calibration; keeping defaults")
+
+            await client.write_gatt_char(
+                cc.COMMAND_CHAR,
+                cc.player_lights_command(self.mappings.player_light),
+                response=False,
+            )
+        except Exception:
+            log.exception("controller configuration failed; continuing anyway")
+        finally:
+            # Nothing reads this channel once configuration is done, and every
+            # extra notification stream is airtime competing with the input
+            # report on a 30 ms connection interval.
+            try:
+                await client.stop_notify(cc.RESPONSE_CHAR)
+            except Exception:
+                pass
+
+    # --- raw capture (diagnostics) ---
+
+    def start_raw_capture(self, count=None):
+        """Dump the next N raw reports to the log, for protocol work."""
+        self._raw_remaining = count or self.RAW_CAPTURE_LIMIT
+        log.info("raw capture armed for %d reports", self._raw_remaining)
+
+    @property
+    def raw_capture_active(self):
+        return self._raw_remaining > 0
 
     # --- BLE input parser ---
 
-    def _on_data(self, sender, data: bytes):
-        if len(data) < 11:
-            return
+    def _decode_motion(self, data):
+        """Decode the IMU if the user has configured where it lives.
 
-        self.packet_count += 1
+        The Switch 2 report layout is not published and we refuse to guess:
+        with no offsets configured this returns zeros, which DSU clients read
+        as "no motion" rather than as garbage.
+        """
+        m = self.mappings
+        if not m.motion_enabled:
+            return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
 
-        b = self.mappings.buttons
-        b2, b3, b4 = data[2], data[3], data[4]
+        def triple(offset, scale):
+            if offset is None or len(data) < offset + 6:
+                return (0.0, 0.0, 0.0)
+            x, y, z = struct.unpack_from("<3h", data, offset)
+            return (x * scale, y * scale, z * scale)
 
-        # face buttons (byte 2)
-        self._set_key('B', b.get('B'), b2 & 0x01)
-        self._set_key('A', b.get('A'), b2 & 0x02)
-        self._set_key('Y', b.get('Y'), b2 & 0x04)
-        self._set_key('X', b.get('X'), b2 & 0x08)
-        self._set_key('R', b.get('R'), b2 & 0x10)
-        self._set_key('ZR', b.get('ZR'), b2 & 0x20)
-        self._set_key('+', b.get('+'), b2 & 0x40)
-        self._set_key('RS', b.get('RS'), b2 & 0x80)
+        return (
+            triple(m.motion_accel_offset, m.motion_accel_scale),
+            triple(m.motion_gyro_offset, m.motion_gyro_scale),
+        )
 
-        # d-pad + left shoulder/trigger (byte 3)
-        self._set_key('DDOWN', b.get('DDOWN'), b3 & 0x01)
-        self._set_key('DRIGHT', b.get('DRIGHT'), b3 & 0x02)
-        self._set_key('DLEFT', b.get('DLEFT'), b3 & 0x04)
-        self._set_key('DUP', b.get('DUP'), b3 & 0x08)
-        self._set_key('L', b.get('L'), b3 & 0x10)
-        self._set_key('ZL', b.get('ZL'), b3 & 0x20)
-        self._set_key('-', b.get('-'), b3 & 0x40)
-        self._set_key('LS', b.get('LS'), b3 & 0x80)
-
-        # special (byte 4) — 0x02 is believed to be the new C button
-        self._set_key('HOME', b.get('HOME'), b4 & 0x01)
-        self._set_key('C', b.get('C'), b4 & 0x02)
-        self._set_key('GR', b.get('GR'), b4 & 0x04)
-        self._set_key('GL', b.get('GL'), b4 & 0x08)
-        self._set_key('CAPT', b.get('CAPT'), b4 & 0x10)
+    def _build_state(self, data: bytes):
+        """Decode one BLE report into a neutral ControllerState."""
+        buttons = {
+            name: bool(data[offset] & mask)
+            for offset, mask, name in self._BUTTON_BITS
+        }
 
         # sticks: 12-bit packed across bytes 5-10
         lx_raw = data[5] | ((data[6] & 0x0F) << 8)
@@ -438,37 +713,53 @@ class ControllerBridge:
         rx_raw = data[8] | ((data[9] & 0x0F) << 8)
         ry_raw = ((data[9] & 0xF0) >> 4) | (data[10] << 4)
 
-        lx = (lx_raw - 2048) / 2048.0
-        ly = (ly_raw - 2048) / 2048.0
-        rx = (rx_raw - 2048) / 2048.0
-        ry = (ry_raw - 2048) / 2048.0
+        cal = self.calibration
+        cal.observe({'lx': lx_raw, 'ly': ly_raw, 'rx': rx_raw, 'ry': ry_raw})
+        deadzone = self.mappings.stick_deadzone
+        saturation = self.mappings.stick_saturation
+        lx, ly = shape_stick(
+            cal.value('lx', lx_raw), cal.value('ly', ly_raw), deadzone, saturation
+        )
+        rx, ry = shape_stick(
+            cal.value('rx', rx_raw), cal.value('ry', ry_raw), deadzone, saturation
+        )
 
-        ls = self.mappings.left_stick
-        rs = self.mappings.right_stick
+        accel, gyro = self._decode_motion(data)
+        return ControllerState(
+            buttons=buttons, lx=lx, ly=ly, rx=rx, ry=ry,
+            accel=accel, gyro=gyro,
+            timestamp_us=time.monotonic_ns() // 1000,
+        )
 
-        self._set_stick_key('ls_up',    ls.get('up'),    ly)
-        self._set_stick_key('ls_down',  ls.get('down'),  -ly)
-        self._set_stick_key('ls_left',  ls.get('left'),  -lx)
-        self._set_stick_key('ls_right', ls.get('right'), lx)
+    def _on_data(self, sender, data: bytes):
+        if len(data) < self.MIN_REPORT_LEN:
+            return
 
-        self._set_stick_key('rs_up',    rs.get('up'),    ry)
-        self._set_stick_key('rs_down',  rs.get('down'),  -ry)
-        self._set_stick_key('rs_left',  rs.get('left'),  -rx)
-        self._set_stick_key('rs_right', rs.get('right'), rx)
+        self.packet_count += 1
 
-        # forward everything to the DSU server (true analog for emulators)
+        if self._raw_remaining > 0:
+            self._raw_remaining -= 1
+            log.info("raw[%3d] len=%d %s",
+                     self._raw_remaining, len(data), bytes(data).hex())
+
+        try:
+            state = self._build_state(data)
+        except Exception:
+            log.exception("failed to decode report: %s", bytes(data).hex())
+            return
+        self.last_state = state
+
+        # Fan out. One failing backend must not stop the others.
         if self.dsu is not None and self.dsu.running:
-            self.dsu.push(
-                {
-                    'B': b2 & 0x01, 'A': b2 & 0x02, 'Y': b2 & 0x04, 'X': b2 & 0x08,
-                    'R': b2 & 0x10, 'ZR': b2 & 0x20, '+': b2 & 0x40, 'RS': b2 & 0x80,
-                    'DDOWN': b3 & 0x01, 'DRIGHT': b3 & 0x02, 'DLEFT': b3 & 0x04,
-                    'DUP': b3 & 0x08, 'L': b3 & 0x10, 'ZL': b3 & 0x20,
-                    '-': b3 & 0x40, 'LS': b3 & 0x80,
-                    'HOME': b4 & 0x01, 'CAPT': b4 & 0x10,
-                },
-                lx, ly, rx, ry,
-            )
+            try:
+                self.dsu.push(state)
+            except Exception:
+                log.exception("DSU push failed")
+        if self.keyboard is not None and self.keyboard.enabled:
+            try:
+                self.keyboard.push(state)
+            except Exception:
+                log.exception("keyboard push failed")
 
     # --- discovery ---
 
@@ -528,6 +819,10 @@ class ControllerBridge:
                 self.last_error = f"Connection error: {e}"
                 return False
 
+            # Re-learn the resting centre for each new session: the drift is
+            # per-connection, not per-unit. Factory calibration, read below,
+            # supersedes it when available.
+            self.calibration.reset()
             self.controller_name = name
             self.is_connecting = False
             self.is_connected = True
@@ -538,8 +833,15 @@ class ControllerBridge:
             if reconnected:
                 self.last_notice = f"Reconnected to {name}"
 
-            while not self._stop_event.is_set() and client.is_connected:
-                await asyncio.sleep(0.1)
+            # Configuration is an enhancement, not a precondition. Run it
+            # alongside the stream so a silent controller neither delays the
+            # connection nor slows down noticing a drop.
+            config_task = asyncio.create_task(self._configure_with_timeout(client))
+            try:
+                while not self._stop_event.is_set() and client.is_connected:
+                    await asyncio.sleep(0.1)
+            finally:
+                config_task.cancel()
             return True
         finally:
             self.is_connecting = False
@@ -711,8 +1013,12 @@ class Switch2BridgeApp(rumps.App):
 
         self.mappings = Mappings()
         self.mappings.load()
-        self.dsu = DSUServer(self.mappings.dsu_host, self.mappings.dsu_port)
-        self.bridge = ControllerBridge(self.mappings, self.dsu)
+        self.dsu = DSUServer(
+            self.mappings.dsu_host, self.mappings.dsu_port,
+            aliases=self.mappings.dsu_aliases,
+        )
+        self.keyboard = KeyboardOutput(self.mappings)
+        self.bridge = ControllerBridge(self.mappings, self.dsu, self.keyboard)
 
         # Long-lived menu items
         self._status_item = rumps.MenuItem("○ Not connected")
@@ -722,6 +1028,15 @@ class Switch2BridgeApp(rumps.App):
         self._reveal_item = rumps.MenuItem("Edit mappings file…", callback=self._reveal_mappings)
         self._reload_item = rumps.MenuItem("Reload mappings", callback=self._reload_mappings)
         self._dsu_item = rumps.MenuItem("DSU server", callback=self._toggle_dsu)
+        self._keyboard_item = rumps.MenuItem(
+            "Keyboard bridge (legacy)", callback=self._toggle_keyboard
+        )
+        self._recal_item = rumps.MenuItem(
+            "Recalibrate sticks", callback=self._recalibrate
+        )
+        self._capture_item = rumps.MenuItem(
+            "Capture raw packets", callback=self._toggle_raw_capture
+        )
         self._login_item = rumps.MenuItem("Start at Login", callback=self._toggle_login)
         self._logs_item = rumps.MenuItem("Open logs…", callback=self._open_logs)
         self._version_item = rumps.MenuItem(f"{APP_NAME} v{APP_VERSION}")
@@ -738,6 +1053,10 @@ class Switch2BridgeApp(rumps.App):
             self._reload_item,
             None,
             self._dsu_item,
+            self._keyboard_item,
+            self._recal_item,
+            None,
+            self._capture_item,
             self._login_item,
             self._logs_item,
             None,
@@ -745,6 +1064,7 @@ class Switch2BridgeApp(rumps.App):
             self._quit_item,
         ]
         self._sync_dsu()
+        self._sync_keyboard(prompt=False)  # first tick prompts, once the UI is up
         self._sync_login_item()
         # packets/s: sampled by the UI tick
         self._rate_prev_count = 0
@@ -752,6 +1072,8 @@ class Switch2BridgeApp(rumps.App):
 
         self._last_state = None
         self._accessibility_checked = False
+        # Warn once per connection that nothing is consuming the input
+        self._warned_no_consumer = False
         # Short error shown in the dropdown while idle — notifications are
         # unreliable when running from source, the menu is always visible
         self._idle_note = None
@@ -812,14 +1134,27 @@ class Switch2BridgeApp(rumps.App):
             self._detail_item.title = " "
             self._action_item.title = "Connect Controller"
             self._action_item.set_callback(self._on_action)
+        if state != 'connected':
+            self._warned_no_consumer = False  # warn again next connection
         self._last_state = state
 
     def _tick(self, _):
         """Runs every REFRESH_INTERVAL on the main thread."""
         if not self._accessibility_checked:
             self._accessibility_checked = True
-            self._check_accessibility()
+            # DSU needs no permissions — only the keyboard bridge does.
+            if self.keyboard.enabled:
+                self._check_accessibility()
             self._surface_mappings_messages()
+
+        if self.keyboard.last_error:
+            err = self.keyboard.last_error
+            self.keyboard.last_error = None
+            log.warning("user-visible keyboard error: %s", err)
+            self._notify("Keyboard bridge", err)
+
+        if self._capture_item.state and not self.bridge.raw_capture_active:
+            self._capture_item.state = 0  # capture finished on its own
 
         if self.bridge.last_error:
             err = self.bridge.last_error
@@ -853,11 +1188,30 @@ class Switch2BridgeApp(rumps.App):
             rate = max(0.0, (count - self._rate_prev_count) / elapsed) if elapsed > 0 else 0.0
             self._rate_prev_count, self._rate_prev_time = count, now
             detail = f"   {count} pkts · {rate:.0f}/s"
-            if self.dsu.running:
-                n = self.dsu.client_count()
-                if n:
-                    detail += f" · DSU: {n} client{'s' if n > 1 else ''}"
+            clients = self.dsu.client_count() if self.dsu.running else 0
+            if clients:
+                detail += f" · DSU: {clients} client{'s' if clients > 1 else ''}"
             self._detail_item.title = detail
+
+            # Reading the controller is useless if nothing consumes it. That
+            # state looks identical to "working" without saying so.
+            if not clients and not self.keyboard.enabled:
+                self._status_item.title = (
+                    f"✓ {self.bridge.controller_name or 'Controller'} "
+                    "— ⚠️ nothing listening"
+                )
+                self._detail_item.title = "   No DSU client · keyboard bridge off"
+                if not self._warned_no_consumer:
+                    self._warned_no_consumer = True
+                    self._notify(
+                        "Controller connected, but unused",
+                        "No emulator is reading the DSU gamepad and the "
+                        "keyboard bridge is off. Point your emulator at "
+                        f"{self.dsu.host}:{self.dsu.port}, or enable the "
+                        "keyboard bridge from this menu.",
+                    )
+            else:
+                self._warned_no_consumer = False
 
     # --- actions ---
 
@@ -873,34 +1227,68 @@ class Switch2BridgeApp(rumps.App):
         self._tick(None)
 
     def _show_mapping(self, _):
-        b = self.mappings.buttons
-        ls = self.mappings.left_stick
-        rs = self.mappings.right_stick
+        m = self.mappings
 
         def fmt(value):
-            if value is None:
-                return "—"
-            if isinstance(value, str):
-                return value
-            return f"<{value.name}>"  # Key enum
+            return value if value else "—"
 
-        lines = [
-            "Current mapping",
+        lines = ["Output"]
+        if self.dsu.running:
+            clients = self.dsu.client_count()
+            lines.append(
+                f"  ✓ DSU gamepad on {self.dsu.host}:{self.dsu.port} "
+                f"({clients} client{'' if clients == 1 else 's'})"
+            )
+            lines.append("    Analog sticks, full range — this is the real controller.")
+        else:
+            lines.append("  ○ DSU gamepad off — emulators cannot see the controller.")
+        lines.append(
+            f"  {'✓' if self.keyboard.enabled else '○'} Keyboard bridge "
+            f"({'on' if self.keyboard.enabled else 'off'}, legacy)"
+        )
+        lines.append(
+            f"  {'✓' if m.motion_enabled else '○'} Motion "
+            f"({'decoding' if m.motion_enabled else 'not configured'})"
+        )
+
+        lines += [
             "",
-            f"  A→{fmt(b.get('A'))}  B→{fmt(b.get('B'))}  X→{fmt(b.get('X'))}  Y→{fmt(b.get('Y'))}",
-            f"  L→{fmt(b.get('L'))}  R→{fmt(b.get('R'))}  ZL→{fmt(b.get('ZL'))}  ZR→{fmt(b.get('ZR'))}",
-            f"  +→{fmt(b.get('+'))}  -→{fmt(b.get('-'))}  Home→{fmt(b.get('HOME'))}  Capture→{fmt(b.get('CAPT'))}",
-            f"  GL→{fmt(b.get('GL'))}  GR→{fmt(b.get('GR'))}  LS→{fmt(b.get('LS'))}  RS→{fmt(b.get('RS'))}",
-            f"  C→{fmt(b.get('C'))}",
-            "",
-            f"  Left stick: {fmt(ls.get('up'))}/{fmt(ls.get('left'))}/{fmt(ls.get('down'))}/{fmt(ls.get('right'))} (U/L/D/R)",
-            f"  Right stick: {fmt(rs.get('up'))}/{fmt(rs.get('left'))}/{fmt(rs.get('down'))}/{fmt(rs.get('right'))} (U/L/D/R)",
-            f"  D-Pad: {fmt(b.get('DUP'))}/{fmt(b.get('DLEFT'))}/{fmt(b.get('DDOWN'))}/{fmt(b.get('DRIGHT'))} (U/L/D/R)",
-            f"  Stick threshold: {self.mappings.stick_threshold}",
-            "",
-            f"Edit: {MAPPINGS_FILE}",
+            "DSU button layout (positional)",
+            "  A→Circle  B→Cross  X→Triangle  Y→Square",
+            "  L/R→L1/R1  ZL/ZR→L2/R2  −→Share  +→Options",
+            "  Home→PS  Capture→Touch  LS/RS→L3/R3",
         ]
-        rumps.alert(title="Button Mapping", message="\n".join(lines), ok="OK")
+        aliases = m.dsu_aliases
+        lines.append(
+            "  " + (
+                "  ".join(f"{k}→{v}" for k, v in sorted(aliases.items()))
+                if aliases else
+                "GL/GR/C: unmapped (no DSU slot — alias them in mappings.json)"
+            )
+        )
+        lines += [
+            "",
+            f"Sticks: deadzone {m.stick_deadzone}, saturation {m.stick_saturation}",
+        ]
+
+        if self.keyboard.enabled:
+            b, ls, rs = m.buttons, m.left_stick, m.right_stick
+            lines += [
+                "",
+                "Keyboard bridge mapping",
+                f"  A→{fmt(b.get('A'))}  B→{fmt(b.get('B'))}  X→{fmt(b.get('X'))}  Y→{fmt(b.get('Y'))}",
+                f"  L→{fmt(b.get('L'))}  R→{fmt(b.get('R'))}  ZL→{fmt(b.get('ZL'))}  ZR→{fmt(b.get('ZR'))}",
+                f"  +→{fmt(b.get('+'))}  -→{fmt(b.get('-'))}  Home→{fmt(b.get('HOME'))}  Capture→{fmt(b.get('CAPT'))}",
+                f"  GL→{fmt(b.get('GL'))}  GR→{fmt(b.get('GR'))}  LS→{fmt(b.get('LS'))}  RS→{fmt(b.get('RS'))}",
+                f"  C→{fmt(b.get('C'))}",
+                f"  Left stick: {fmt(ls.get('up'))}/{fmt(ls.get('left'))}/{fmt(ls.get('down'))}/{fmt(ls.get('right'))} (U/L/D/R)",
+                f"  Right stick: {fmt(rs.get('up'))}/{fmt(rs.get('left'))}/{fmt(rs.get('down'))}/{fmt(rs.get('right'))} (U/L/D/R)",
+                f"  D-Pad: {fmt(b.get('DUP'))}/{fmt(b.get('DLEFT'))}/{fmt(b.get('DDOWN'))}/{fmt(b.get('DRIGHT'))} (U/L/D/R)",
+                f"  Threshold: {m.stick_threshold}",
+            ]
+
+        lines += ["", f"Edit: {MAPPINGS_FILE}"]
+        rumps.alert(title="Controller Output", message="\n".join(lines), ok="OK")
 
     def _reveal_mappings(self, _):
         Mappings.ensure_default_file()
@@ -915,6 +1303,7 @@ class Switch2BridgeApp(rumps.App):
         self.bridge.release_all_keys()
         ok = self.mappings.load()
         self._sync_dsu()
+        self._sync_keyboard()
         self._surface_mappings_messages()
         if ok:
             self._notify("Mappings reloaded", f"Loaded from {MAPPINGS_FILE.name}")
@@ -931,15 +1320,53 @@ class Switch2BridgeApp(rumps.App):
             self.dsu.stop()
         if settings_changed:
             self.dsu.host, self.dsu.port = m.dsu_host, m.dsu_port
+        self.dsu.aliases = dict(m.dsu_aliases)
         if m.dsu_enabled and not self.dsu.running:
             self.dsu.start()
         self.dsu.set_connected(self.bridge.is_connected)
         if self.dsu.running:
-            self._dsu_item.title = f"DSU server ({self.dsu.host}:{self.dsu.port})"
+            self._dsu_item.title = f"DSU gamepad ({self.dsu.host}:{self.dsu.port})"
             self._dsu_item.state = 1
         else:
-            self._dsu_item.title = "DSU server"
+            self._dsu_item.title = "DSU gamepad"
             self._dsu_item.state = 0
+
+    def _toggle_keyboard(self, _):
+        self.mappings.set_keyboard_enabled(not self.mappings.keyboard_enabled)
+        self._sync_keyboard()
+
+    def _sync_keyboard(self, prompt=True):
+        """Reconcile the legacy keyboard bridge with the current settings."""
+        want = self.mappings.keyboard_enabled
+        if want and not self.keyboard.enabled:
+            if self.keyboard.start():
+                # Typing only works once Accessibility is granted, and the
+                # prompt is pointless until the user actually wants keys.
+                if prompt:
+                    self._check_accessibility()
+            else:
+                self.mappings.set_keyboard_enabled(False)
+        elif not want and self.keyboard.enabled:
+            self.keyboard.stop()
+        self._keyboard_item.state = 1 if self.keyboard.enabled else 0
+
+    def _recalibrate(self, _):
+        self.bridge.calibration.reset()
+        self._notify(
+            "Sticks", "Let go of both sticks — the centre is being re-measured."
+        )
+
+    def _toggle_raw_capture(self, _):
+        if self.bridge.raw_capture_active:
+            self.bridge.start_raw_capture(0)
+        else:
+            self.bridge.start_raw_capture()
+            self._notify(
+                "Raw capture",
+                f"Logging the next {ControllerBridge.RAW_CAPTURE_LIMIT} reports "
+                f"to bridge.log.",
+            )
+        self._capture_item.state = 1 if self.bridge.raw_capture_active else 0
 
     def _login_service(self):
         """SMAppService for the main app, or None when unavailable.
@@ -996,7 +1423,7 @@ class Switch2BridgeApp(rumps.App):
         log.info("quitting")
         self.bridge.disconnect(wait=True, timeout=2.0)
         # Belt & suspenders: never leave a key logically held after exit
-        self.bridge.release_all_keys()
+        self.keyboard.stop()
         self.dsu.stop()
         rumps.quit_application()
 
@@ -1010,11 +1437,13 @@ class Switch2BridgeApp(rumps.App):
             clicked_ok = rumps.alert(
                 title="Accessibility Required",
                 message=(
-                    f"{APP_NAME} needs Accessibility access to simulate keyboard "
-                    "input.\n\n"
+                    "The legacy keyboard bridge needs Accessibility access to "
+                    "simulate key presses.\n\n"
                     "Grant access in:\n"
                     "System Settings → Privacy & Security → Accessibility\n\n"
-                    "You may need to quit and relaunch after granting access."
+                    "You may need to quit and relaunch after granting access.\n\n"
+                    "You can skip this entirely: the DSU gamepad output needs "
+                    "no permissions and gives emulators true analog sticks."
                 ),
                 ok="Open System Settings",
                 cancel="Later",

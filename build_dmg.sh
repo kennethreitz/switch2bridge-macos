@@ -90,19 +90,39 @@ Switch2 Bridge - Installation
 2. Launch from Applications
    (Right-click → Open the first time)
 
-3. Grant Bluetooth and Accessibility permissions
-   when macOS prompts you
+3. Grant Bluetooth when macOS prompts you.
+   That is the only permission needed.
 
-4. Click 🎮 in the menu bar to connect your
-   Switch 2 Pro Controller
+4. Click the controller icon in the menu bar,
+   then "Connect Controller".
 
 
-Ryujinx Configuration:
-  Settings → Input → Keyboard → Pro Controller
-  
-  A→Z  B→X  X→C  Y→V
-  L→Q  R→E  ZL→1  ZR→3
-  Sticks: WASD / IJKL
+The controller is exposed to emulators as a real
+analog gamepad over DSU (cemuhook) on
+127.0.0.1:26760 — no driver, no Accessibility.
+
+  Dolphin  Options > Controller Settings >
+           Alternate Input Sources > DSU Client
+           Add 127.0.0.1:26760
+
+  Cemu     Input settings > add a DSUController
+           at the same address
+
+  Ryujinx  Settings > Input > add controller.
+           Motion needs "Use CemuHook compatible
+           motion" (see note below).
+
+The menu bar shows how many DSU clients are
+attached, so you can tell whether the emulator
+actually connected.
+
+Motion/gyro is not available yet: the controller
+does not stream IMU data in its BLE reports.
+
+A legacy keyboard bridge is still included for
+emulators that only read the keyboard. It is OFF
+by default and needs Accessibility; enable it from
+the menu bar ("Keyboard bridge").
 README
 
 # Build DMG

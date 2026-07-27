@@ -3,8 +3,13 @@ DSU (cemuhook) server for Switch2 Bridge
 ========================================
 
 Exposes the controller as a DSU pad on UDP so emulators that speak the
-cemuhook protocol (Dolphin, Cemu, and Ryujinx for motion) can read the
-sticks as true analog inputs — no driver needed.
+cemuhook protocol (Dolphin, Cemu, Ryujinx) can read it as a real analog
+gamepad — no driver, no permissions, no keyboard in the middle.
+
+The pad presents itself as a Switch Pro Controller: full gyro model, a
+Bluetooth connection type, and the Switch face-button layout mapped to its
+positional DSU equivalents (A is the right face button, so it lands on
+Circle, and so on).
 
 Protocol reference: https://github.com/v1993/cemuhook-protocol
 """
@@ -31,6 +36,12 @@ PAD_SLOT = 0
 MODEL_FULL_GYRO = 2
 CONN_BLUETOOTH = 2
 BATTERY_NA = 0x00
+BATTERY_FULL = 0x05
+
+# DSU has exactly 16 button slots and no room for the Switch 2's extra
+# GL/GR/C buttons. They stay unmapped unless the user aliases them onto a
+# DSU button in mappings.json.
+ALIASABLE_BUTTONS = ('GL', 'GR', 'C')
 
 # Clients must re-send a data request at least this often to keep receiving
 CLIENT_TIMEOUT = 5.0
@@ -62,9 +73,12 @@ def _axis_to_byte(value):
 class DSUServer:
     """Threaded UDP server. `push()` may be called from any thread."""
 
-    def __init__(self, host="127.0.0.1", port=26760):
+    def __init__(self, host="127.0.0.1", port=26760, aliases=None):
         self.host = host
         self.port = port
+        # Switch 2-only buttons folded onto DSU slots, e.g. {"GL": "L"}
+        self.aliases = dict(aliases or {})
+        self.battery = BATTERY_NA
         self.last_error = None  # consumed by the UI tick
         self._sock = None
         self._thread = None
@@ -142,11 +156,20 @@ class DSUServer:
             state = 2 if self._connected else 0
             return struct.pack(
                 "<BBBB6sB", slot, state, MODEL_FULL_GYRO, CONN_BLUETOOTH,
-                PAD_MAC, BATTERY_NA,
+                PAD_MAC, self.battery,
             )
         return struct.pack("<BBBB6sB", slot, 0, 0, 0, b"\x00" * 6, 0)
 
-    def _data_packet(self, buttons, lx, ly, rx, ry):
+    def _effective_buttons(self, state):
+        """State buttons plus any aliased Switch 2-only buttons folded in."""
+        buttons = dict(state.buttons)
+        for source, target in self.aliases.items():
+            if state.pressed(source):
+                buttons[target] = 1
+        return buttons
+
+    def _data_packet(self, state):
+        buttons = self._effective_buttons(state)
         b1 = 0
         for bit, name in _BUTTONS1:
             if buttons.get(name):
@@ -166,15 +189,18 @@ class DSUServer:
         )
         payload += struct.pack(
             "<BBBB",
-            _axis_to_byte(lx), _axis_to_byte(ly),
-            _axis_to_byte(rx), _axis_to_byte(ry),
+            _axis_to_byte(state.lx), _axis_to_byte(state.ly),
+            _axis_to_byte(state.rx), _axis_to_byte(state.ry),
         )
         payload += bytes(
             0xFF if buttons.get(name) else 0 for name in _ANALOG_ORDER
         )
         payload += b"\x00" * 12  # two (inactive) touch structs
-        payload += struct.pack("<Q", time.monotonic_ns() // 1000)
-        payload += struct.pack("<6f", 0, 0, 0, 0, 0, 0)  # accel + gyro (not decoded yet)
+        timestamp = state.timestamp_us or (time.monotonic_ns() // 1000)
+        payload += struct.pack("<Q", timestamp)
+        ax, ay, az = state.accel
+        gp, gy, gr = state.gyro
+        payload += struct.pack("<6f", ax, ay, az, gp, gy, gr)
         return self._packet(MSG_DATA, payload)
 
     # --- server loop ---
@@ -220,7 +246,8 @@ class DSUServer:
 
     # --- input feed (called from the BLE thread) ---
 
-    def push(self, buttons, lx, ly, rx, ry):
+    def push(self, state):
+        """Broadcast one ControllerState to every subscribed DSU client."""
         sock = self._sock
         if sock is None or self._stop.is_set():
             return
@@ -232,7 +259,7 @@ class DSUServer:
             targets = list(self._clients)
         if not targets:
             return
-        pkt = self._data_packet(buttons, lx, ly, rx, ry)
+        pkt = self._data_packet(state)
         for addr in targets:
             try:
                 sock.sendto(pkt, addr)

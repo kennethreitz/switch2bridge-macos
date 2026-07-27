@@ -24,3 +24,6 @@ env/
 # IDE (Visual Studio Code, etc.)
 .vscode/
 .idea/
+
+# Protocol captures from tools/capture_packets.py
+capture*.jsonl

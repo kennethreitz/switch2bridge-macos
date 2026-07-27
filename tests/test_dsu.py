@@ -8,7 +8,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dsu_server as D
+from controller_state import ControllerState
 from dsu_server import DSUServer
+
+
+def state(buttons=None, lx=0.0, ly=0.0, rx=0.0, ry=0.0, **kw):
+    return ControllerState(buttons=buttons or {}, lx=lx, ly=ly, rx=rx, ry=ry, **kw)
 
 FAILURES = []
 
@@ -25,6 +30,18 @@ def client_packet(msg_type, payload=b""):
     pkt = bytearray(header + data)
     struct.pack_into("<I", pkt, 8, zlib.crc32(bytes(pkt)) & 0xFFFFFFFF)
     return bytes(pkt)
+
+def drain(sock):
+    """Discard queued datagrams so a check reads the packet it just caused."""
+    sock.settimeout(0.05)
+    try:
+        while True:
+            sock.recvfrom(1024)
+    except socket.timeout:
+        pass
+    finally:
+        sock.settimeout(2.0)
+
 
 def crc_ok(pkt):
     stored = struct.unpack_from("<I", pkt, 8)[0]
@@ -84,7 +101,7 @@ time.sleep(0.1)  # let the server register the client
 check("client registered", srv.client_count() == 1)
 
 buttons = {'A': 1, 'ZL': 1, 'DUP': 1, '-': 1, 'HOME': 1, 'CAPT': 0}
-srv.push(buttons, 0.5, -1.0, 0.0, 1.0)
+srv.push(state(buttons, lx=0.5, ly=-1.0, rx=0.0, ry=1.0))
 pkt, _ = cli.recvfrom(1024)
 check("data: 100 bytes", len(pkt) == 100, len(pkt))
 check("data: crc", crc_ok(pkt))
@@ -122,7 +139,7 @@ check("data: motion timestamp set", ts > 0)
 floats = struct.unpack_from("<6f", pkt, 76)
 check("data: motion zeroed", all(f == 0.0 for f in floats))
 
-srv.push(buttons, 0, 0, 0, 0)
+srv.push(state(buttons))
 pkt2, _ = cli.recvfrom(1024)
 c2 = struct.unpack_from("<I", pkt2, 32)[0]
 check("data: counter increments", c2 == c1 + 1, (c1, c2))
@@ -132,7 +149,7 @@ print("== expiry ==")
 with srv._lock:
     for a in srv._clients:
         srv._clients[a] -= (D.CLIENT_TIMEOUT + 1)
-srv.push(buttons, 0, 0, 0, 0)
+srv.push(state(buttons))
 try:
     cli.settimeout(0.5)
     cli.recvfrom(1024)
@@ -154,8 +171,6 @@ check("server survives garbage", srv.running)
 print("== bridge integration ==")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import Switch2Bridge as S2B
-S2B.keyboard.press = lambda k: None
-S2B.keyboard.release = lambda k: None
 
 mm = S2B.Mappings()
 mm._apply(mm.DEFAULT)
@@ -183,10 +198,61 @@ check("bridge->dsu: A->Circle", pkt[37] & 0x20)
 check("bridge->dsu: analog ly high", pkt[41] >= 254, pkt[41])
 check("bridge->dsu: rx centered", 127 <= pkt[42] <= 129, pkt[42])
 
+# CAPT and C were swapped before the timed capture; lock the corrected map in
+br._on_data(None, packet(b4=0x02))
+pkt, _ = cli.recvfrom(1024)
+check("bridge->dsu: b4 0x02 is CAPT (touch)", pkt[39] == 0xFF, pkt[39])
+check("bridge->dsu: b4 0x02 is not HOME", pkt[38] == 0x00, pkt[38])
+
+br._on_data(None, packet(b4=0x10))
+pkt, _ = cli.recvfrom(1024)
+check("bridge->dsu: b4 0x10 (C) is not CAPT", pkt[39] == 0x00, pkt[39])
+check("bridge->dsu: C decoded", br.last_state.pressed('C'))
+check("bridge->dsu: CAPT not set by C", not br.last_state.pressed('CAPT'))
+
+br._on_data(None, packet(b4=0x08))
+check("bridge->dsu: b4 0x08 is GL", br.last_state.pressed('GL'))
+br._on_data(None, packet(b4=0x01))
+check("bridge->dsu: b4 0x01 is HOME", br.last_state.pressed('HOME'))
+
+# ============ motion ============
+print("== motion ==")
+drain(cli)
+srv.push(state(buttons, accel=(0.5, -0.25, 1.0), gyro=(10.0, -20.0, 30.0)))
+pkt, _ = cli.recvfrom(1024)
+floats = struct.unpack_from("<6f", pkt, 76)
+check("motion: accel forwarded",
+      all(abs(a - b) < 1e-5 for a, b in zip(floats[:3], (0.5, -0.25, 1.0))), floats[:3])
+check("motion: gyro forwarded",
+      all(abs(a - b) < 1e-5 for a, b in zip(floats[3:], (10.0, -20.0, 30.0))), floats[3:])
+ts = struct.unpack_from("<Q", pkt, 68)[0]
+srv.push(state(buttons, timestamp_us=123456))
+pkt, _ = cli.recvfrom(1024)
+check("motion: explicit timestamp used",
+      struct.unpack_from("<Q", pkt, 68)[0] == 123456)
+
+# ============ Switch 2-only button aliases ============
+print("== aliases ==")
+drain(cli)
+srv.aliases = {"GL": "L", "C": "HOME"}
+srv.push(state({"GL": 1}))
+pkt, _ = cli.recvfrom(1024)
+check("alias: GL -> L1", pkt[37] & 0x04, hex(pkt[37]))
+srv.push(state({"C": 1}))
+pkt, _ = cli.recvfrom(1024)
+check("alias: C -> PS/HOME", pkt[38] == 0xFF, pkt[38])
+srv.push(state({"GL": 1, "C": 1}))
+pkt, _ = cli.recvfrom(1024)
+check("alias: source button unchanged elsewhere", pkt[37] & 0x04 and pkt[38] == 0xFF)
+srv.aliases = {}
+srv.push(state({"GL": 1, "C": 1}))
+pkt, _ = cli.recvfrom(1024)
+check("alias: unmapped GL/C emit nothing", pkt[37] == 0 and pkt[38] == 0)
+
 # stop
 srv.stop()
 check("stop: not running", not srv.running)
-srv.push(buttons, 0, 0, 0, 0)  # must not raise after stop
+srv.push(state(buttons))  # must not raise after stop
 check("push after stop harmless", True)
 
 print()

@@ -8,11 +8,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import Switch2Bridge as S2B
+from outputs import KeyboardOutput
 
 # --- record key presses instead of sending them ---
 events = []
-S2B.keyboard.press = lambda k: events.append(("press", k))
-S2B.keyboard.release = lambda k: events.append(("release", k))
+
+
+class FakeController:
+    def press(self, key):
+        events.append(("press", key))
+
+    def release(self, key):
+        events.append(("release", key))
+
+
+def make_keyboard(mappings):
+    """A KeyboardOutput that records instead of typing."""
+    keyboard = KeyboardOutput(mappings)
+    keyboard._controller = FakeController()
+    return keyboard
 
 FAILURES = []
 
@@ -30,8 +44,8 @@ check("null unmapped", M._parse_key(None) is None)
 check("<none> unmapped", M._parse_key("<none>") is None)
 check("single char", M._parse_key("a") == "a")
 check("uppercase normalized", M._parse_key("Z") == "z")
-check("f-key", M._parse_key("<f12>") == S2B.Key.f12)
-check("arrow", M._parse_key("<up>") == S2B.Key.up)
+check("f-key", M._parse_key("<f12>") == "<f12>")
+check("arrow", M._parse_key("<up>") == "<up>")
 try:
     M._parse_key("ctrl")
     check("multi-char rejected", False)
@@ -78,44 +92,45 @@ check("first launch writes default + ok True", ok is True and S2B.MAPPINGS_FILE.
 print("== _set_key ref counting ==")
 mm = M()
 mm._apply(json.loads(json.dumps(M.DEFAULT)))
-br = S2B.ControllerBridge(mm)
+kb = make_keyboard(mm)
+br = S2B.ControllerBridge(mm, keyboard_output=kb)
 events.clear()
 
 # two sources sharing key "z"
-br._set_key("A", "z", True)
-br._set_key("B", "z", True)
-br._set_key("A", "z", False)
+kb._set_key("A", "z", True)
+kb._set_key("B", "z", True)
+kb._set_key("A", "z", False)
 check("shared key still held", ("release", "z") not in events, events)
-br._set_key("B", "z", False)
+kb._set_key("B", "z", False)
 check("shared key released once both up", events == [("press", "z"), ("release", "z")], events)
 
 # mapping change while held
 events.clear()
-br._set_key("A", "z", True)
-br._set_key("A", "q", True)  # remapped mid-hold
+kb._set_key("A", "z", True)
+kb._set_key("A", "q", True)  # remapped mid-hold
 check("remap mid-hold swaps keys", events == [("press", "z"), ("release", "z"), ("press", "q")], events)
-br._set_key("A", None, True)  # unmapped mid-hold
+kb._set_key("A", None, True)  # unmapped mid-hold
 check("unmap mid-hold releases", events[-1] == ("release", "q"), events)
 
-# release_all
+# release_all, driven through the bridge to prove the delegation works
 events.clear()
-br._set_key("A", "z", True)
-br._set_key("ls_up", "w", True)
+kb._set_key("A", "z", True)
+kb._set_key("ls_up", "w", True)
 br.release_all_keys()
 check("release_all releases everything",
       sorted(e for e in events if e[0] == "release") == [("release", "w"), ("release", "z")], events)
-check("release_all clears state", not br._key_refs and not br._source_keys)
+check("release_all clears state", not kb._key_refs and not kb._source_keys)
 
 # ============ hysteresis ============
 print("== stick hysteresis ==")
 events.clear()
-br._set_stick_key("ls_up", "w", 0.45)   # below 0.5 -> no press
+kb._set_stick_key("ls_up", "w", 0.45)   # below 0.5 -> no press
 check("below threshold no press", events == [])
-br._set_stick_key("ls_up", "w", 0.55)   # above -> press
+kb._set_stick_key("ls_up", "w", 0.55)   # above -> press
 check("above threshold press", events == [("press", "w")])
-br._set_stick_key("ls_up", "w", 0.45)   # above 0.4 (=0.8*0.5) -> stays held
+kb._set_stick_key("ls_up", "w", 0.45)   # above 0.4 (=0.8*0.5) -> stays held
 check("hysteresis holds", events == [("press", "w")])
-br._set_stick_key("ls_up", "w", 0.35)   # below 0.4 -> release
+kb._set_stick_key("ls_up", "w", 0.35)   # below 0.4 -> release
 check("below release threshold releases", events[-1] == ("release", "w"))
 
 # ============ _on_data packet parsing ============
@@ -131,7 +146,8 @@ def packet(b2=0, b3=0, b4=0, lx=2048, ly=2048, rx=2048, ry=2048):
     d[10] = (ry >> 4) & 0xFF
     return bytes(d)
 
-br2 = S2B.ControllerBridge(mm)
+kb2 = make_keyboard(mm)
+br2 = S2B.ControllerBridge(mm, keyboard_output=kb2)
 events.clear()
 br2._on_data(None, packet(b2=0x02))          # A pressed
 check("A press -> z", ("press", "z") in events, events)
@@ -139,8 +155,10 @@ br2._on_data(None, packet(b2=0x00))          # A released
 check("A release -> z up", ("release", "z") in events, events)
 
 events.clear()
-br2._on_data(None, packet(b4=0x02))          # C pressed, unmapped by default
+br2._on_data(None, packet(b4=0x10))          # C pressed, unmapped by default
 check("unmapped C -> nothing", events == [], events)
+check("C decoded on state", br2.last_state.pressed("C"))
+check("C is not CAPT", not br2.last_state.pressed("CAPT"))
 
 events.clear()
 br2._on_data(None, packet(ly=4000))          # left stick up
@@ -154,13 +172,14 @@ br2._on_data(None, b"\x00\x01\x02")          # short packet
 check("short packet ignored", events == [] and br2.packet_count == 5)
 
 # dpad + stick sharing same key
-mm.left_stick["up"] = S2B.Key.up  # same as DUP
+mm.left_stick["up"] = "<up>"  # same as DUP
+up_key = kb2._resolve("<up>")
 events.clear()
 br2._on_data(None, packet(b3=0x08, ly=4000))  # DUP + stick up together
 br2._on_data(None, packet(b3=0x00, ly=4000))  # DUP released, stick still up
-check("dpad/stick shared key not stolen", ("release", S2B.Key.up) not in events, events)
+check("dpad/stick shared key not stolen", ("release", up_key) not in events, events)
 br2._on_data(None, packet())
-check("shared key released at rest", ("release", S2B.Key.up) in events)
+check("shared key released at rest", ("release", up_key) in events)
 
 # ============ connect/cancel lifecycle (mock BLE) ============
 print("== lifecycle ==")
@@ -209,8 +228,19 @@ class MockClient:
     def __init__(self, address, timeout=None):
         self.address = address
         self._connected = False
-        self.notify_cb = None
+        # Real clients dispatch per characteristic; the bridge now subscribes
+        # to the command-response channel as well as the input report.
+        self.notify_cbs = {}
+        self.writes = []
         MockClient.instances.append(self)
+
+    @property
+    def notify_cb(self):
+        """Callback for the input report characteristic."""
+        return self.notify_cbs.get(S2B.INPUT_CHAR_UUID)
+
+    async def write_gatt_char(self, uuid, data, response=True):
+        self.writes.append((str(uuid), bytes(data)))
     @property
     def is_connected(self):
         return self._connected
@@ -219,9 +249,9 @@ class MockClient:
     async def disconnect(self):
         self._connected = False
     async def start_notify(self, uuid, cb):
-        self.notify_cb = cb
+        self.notify_cbs[str(uuid)] = cb
     async def stop_notify(self, uuid):
-        pass
+        self.notify_cbs.pop(str(uuid), None)
 
 S2B.BleakClient = MockClient
 

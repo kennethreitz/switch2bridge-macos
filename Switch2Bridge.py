@@ -57,6 +57,7 @@ from controller_state import (
 import controller_commands as cc
 from dsu_server import ALIASABLE_BUTTONS, DSUServer
 from outputs import SPECIAL_KEY_NAMES, KeyboardOutput, pynput_available
+import usb_transport
 
 SMAppService = None
 try:
@@ -70,7 +71,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.4.1"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.5.0"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -133,6 +134,9 @@ class Mappings:
             # Which player LED to light once connected, one bit per LED
             # (1 = player 1, 0x0F = all four, 0 = leave them alone)
             "player_light": 1,
+            # Prefer a wired connection when the controller is plugged in:
+            # 250 Hz and a 4 ms interval, against 33 Hz / 30 ms over Bluetooth
+            "usb": True,
         },
         "motion": {
             # The Switch 2 IMU layout is not confirmed. Run
@@ -185,6 +189,7 @@ class Mappings:
         self.stick_auto_center = True
         self.use_factory_calibration = True
         self.player_light = 1
+        self.usb_enabled = True
         self.left_stick = {}
         self.right_stick = {}
         self.dsu_enabled = True
@@ -416,6 +421,7 @@ class Mappings:
             )
             light = 1
         self.player_light = light
+        self.usb_enabled = bool(controller.get("usb", True))
 
         keyboard_cfg = cfg.get("keyboard", {})
         if not isinstance(keyboard_cfg, dict):
@@ -564,6 +570,8 @@ class ControllerBridge:
             half_range=mappings.stick_half_range,
             auto_center=mappings.stick_auto_center,
         )
+        self.usb = None            # USBTransport while wired
+        self.transport = None      # "usb" or "ble" once connected
         self.is_connected = False
         self.is_searching = False
         self.is_connecting = False
@@ -824,6 +832,7 @@ class ControllerBridge:
             # supersedes it when available.
             self.calibration.reset()
             self.controller_name = name
+            self.transport = "ble"
             self.is_connecting = False
             self.is_connected = True
             self.is_reconnecting = False
@@ -877,6 +886,57 @@ class ControllerBridge:
             return "Bluetooth is turned off. Enable it in Control Center and retry."
         return f"Bluetooth scan failed: {exc}"
 
+    def _try_usb(self):
+        """Wired is preferred when available: 250 Hz against 33 Hz.
+
+        Returns True once streaming. Never fatal — falling back to Bluetooth
+        is always fine.
+        """
+        if not self.mappings.usb_enabled or not usb_transport.is_connected():
+            return False
+
+        def on_report(body):
+            self._on_data(None, body)
+
+        def on_error(message):
+            self.last_error = message
+
+        transport = usb_transport.USBTransport(on_report, on_error)
+        if not transport.connect():
+            if transport.last_error:
+                log.info("wired connect failed: %s", transport.last_error)
+                self.last_notice = "USB found but unavailable — using Bluetooth"
+            return False
+
+        transport.set_player_light(self.mappings.player_light)
+        self.usb = transport
+        self.transport = "usb"
+        self.controller_name = "Switch 2 Pro Controller (wired)"
+        self.is_searching = False
+        self.is_connecting = False
+        self.is_connected = True
+        self.calibration.reset()
+        if self.dsu is not None:
+            self.dsu.set_connected(True)
+        log.info("connected over USB")
+        return True
+
+    async def _usb_session(self):
+        """Stream from the wired controller until it goes away or we stop."""
+        try:
+            while not self._stop_event.is_set() and self.usb.connected:
+                await asyncio.sleep(0.1)
+        finally:
+            transport, self.usb = self.usb, None
+            self.transport = None
+            self.is_connected = False
+            self.controller_name = None
+            if self.dsu is not None:
+                self.dsu.set_connected(False)
+            self.release_all_keys()
+            if transport is not None:
+                transport.disconnect()
+
     async def _connect_async(self):
         was_connected = False
         deadline = time.monotonic() + INITIAL_SCAN_WINDOW
@@ -884,6 +944,14 @@ class ControllerBridge:
             while not self._stop_event.is_set():
                 self.is_searching = True
                 self.packet_count = 0
+
+                if self._try_usb():
+                    await self._usb_session()
+                    if self._stop_event.is_set():
+                        return
+                    # Cable pulled: fall through and look for it over Bluetooth
+                    self.last_notice = "USB disconnected — searching Bluetooth"
+                    continue
                 try:
                     address, name = await self._find_controller()
                 except Exception as e:

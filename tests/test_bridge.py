@@ -183,6 +183,9 @@ check("shared key released at rest", ("release", up_key) in events)
 
 # ============ connect/cancel lifecycle (mock BLE) ============
 print("== lifecycle ==")
+# These drive a mocked BLE stack; without this the bridge would find a real
+# controller on USB and none of the Bluetooth paths would be exercised.
+mm.usb_enabled = False
 
 class MockScanner:
     delay = 0.3
@@ -363,6 +366,34 @@ check("final give-up error surfaced",
       br8.last_error and "reconnect" in br8.last_error.lower(), br8.last_error)
 check("spam test: thread ended", not br8._thread.is_alive())
 MockClient.connect = orig_connect
+
+# ============ wired transport preference ============
+print("== usb preference ==")
+import usb_transport
+
+_real_is_connected = usb_transport.is_connected
+mm_usb = M()
+mm_usb._apply(json.loads(json.dumps(M.DEFAULT)))
+check("usb enabled by default", mm_usb.usb_enabled is True)
+
+br_usb = S2B.ControllerBridge(mm_usb)
+usb_transport.is_connected = lambda: False
+check("no cable -> falls through to bluetooth", br_usb._try_usb() is False)
+
+mm_usb.usb_enabled = False
+usb_transport.is_connected = lambda: True
+check("usb disabled in config -> not tried", br_usb._try_usb() is False)
+usb_transport.is_connected = _real_is_connected
+
+cfg_usb = json.loads(json.dumps(M.DEFAULT))
+cfg_usb["controller"]["usb"] = False
+m_off = M(); m_off._apply(cfg_usb)
+check("usb:false honoured", m_off.usb_enabled is False)
+
+# the wired report is the bluetooth report with a HID report id in front
+body = bytes.fromhex("7e23000000b8378472688638") + bytes(51)
+check("usb body decodes with the same parser",
+      S2B.ControllerBridge(mm_usb)._build_state(body) is not None)
 
 # a corrupt mappings.json must never be clobbered by the DSU toggle
 print("== dsu toggle vs corrupt file ==")

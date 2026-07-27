@@ -39,7 +39,7 @@ OPTIONS = {
     },
     'packages': ['bleak', 'pynput', 'rumps', 'objc'],
     'includes': ['Foundation', 'AppKit', 'CoreBluetooth', 'ApplicationServices',
-                 'ServiceManagement', 'dsu_server', 'controller_state', 'controller_commands', 'outputs'],
+                 'ServiceManagement', 'dsu_server', 'controller_state', 'controller_commands', 'outputs', 'usb_transport'],
 }
 
 setup(

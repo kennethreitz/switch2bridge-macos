@@ -34,7 +34,17 @@ PRODUCT_ID = 0x2069
 
 # Stand-in for the console's Bluetooth address. The controller stores whatever
 # host claims it; a locally-administered address keeps it obviously synthetic.
-HOST_MAC = bytes([0x02, 0x53, 0x32, 0x42, 0x52, 0x47])
+# Switch2Connect sends all-0xFF here rather than a real address.
+HOST_MAC = bytes([0xFF] * 6)
+
+# Verified against TommyWabg/Switch2Connect src/usb_hid_controller.py:
+# commands go to interface 1, endpoint 0x02 over raw USB. The HID output
+# report path below is only a fallback and does not work on macOS.
+USB_COMMAND_INTERFACE = 1
+USB_COMMAND_ENDPOINT_OUT = 0x02
+# Output report body size for the HID fallback (0x2A, not the 63 the report
+# descriptor implies).
+PRO2_OUTPUT_BODY = 0x2A
 
 
 def frame(report_type, command, payload=b"", length=None):
@@ -64,6 +74,39 @@ def build_stages():
         ("player-led", frame(0x09, 0x07, bytes([0x01]), length=0x08),
          "0x09 cmd 0x07 — player LED 1, a visible success signal"),
     ]
+
+
+def try_libusb():
+    """The path that actually works upstream: raw USB to interface 1."""
+    try:
+        import usb.core
+        import usb.util
+    except ImportError:
+        print("pyusb not installed — run: pip install pyusb  (and brew install libusb)")
+        return False
+
+    dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+    if dev is None:
+        print(f"❌ libusb cannot see {VENDOR_ID:#06x}:{PRODUCT_ID:#06x}.")
+        seen = list(usb.core.find(find_all=True))
+        print(f"   {len(seen)} device(s) visible to libusb:")
+        for d in seen:
+            print(f"     {d.idVendor:#06x}:{d.idProduct:#06x}")
+        return False
+
+    print(f"✅ libusb sees {VENDOR_ID:#06x}:{PRODUCT_ID:#06x}\n")
+    for cfg in dev:
+        for intf in cfg:
+            print(f"  interface {intf.bInterfaceNumber} alt {intf.bAlternateSetting} "
+                  f"class={intf.bInterfaceClass:#04x}")
+            for ep in intf:
+                import usb.util as u
+                direction = ("IN " if u.endpoint_direction(ep.bEndpointAddress) == u.ENDPOINT_IN
+                             else "OUT")
+                print(f"     ep {ep.bEndpointAddress:#04x} {direction} "
+                      f"type={u.endpoint_type(ep.bmAttributes)} "
+                      f"maxpkt={ep.wMaxPacketSize}")
+    return True
 
 
 def open_device():
@@ -172,6 +215,11 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--go", action="store_true", help="actually send")
-    ap.add_argument("--pad", type=int, default=0,
-                    help="pad each output report to N bytes (try 64)")
-    sys.exit(main(ap.parse_args()))
+    ap.add_argument("--pad", type=int, default=PRO2_OUTPUT_BODY,
+                    help="pad each output report body to N bytes")
+    ap.add_argument("--libusb", action="store_true",
+                    help="enumerate via libusb and show interface 1 endpoints")
+    parsed = ap.parse_args()
+    if parsed.libusb:
+        sys.exit(0 if try_libusb() else 1)
+    sys.exit(main(parsed))

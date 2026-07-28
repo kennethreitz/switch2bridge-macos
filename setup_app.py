@@ -5,6 +5,7 @@ Usage:
     python setup_app.py py2app
 """
 
+import os
 import re
 
 from setuptools import setup
@@ -16,6 +17,8 @@ ICON = 'AppIcon.icns'
 # which has import-time side effects)
 with open('Switch2Bridge.py') as f:
     VERSION = re.search(r'^APP_VERSION = "(.+)"', f.read(), re.M).group(1)
+
+LIBUSB = '/opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib'
 
 OPTIONS = {
     'argv_emulation': False,
@@ -38,6 +41,9 @@ OPTIONS = {
             'The default DSU gamepad output does not.',
     },
     'packages': ['bleak', 'pynput', 'rumps', 'objc'],
+    # Ship libusb so wired mode works without Homebrew. pyusb otherwise
+    # resolves it through a hardcoded /opt/homebrew path.
+    'frameworks': [LIBUSB] if os.path.exists(LIBUSB) else [],
     'includes': ['Foundation', 'AppKit', 'CoreBluetooth', 'ApplicationServices',
                  'ServiceManagement', 'dsu_server', 'controller_state', 'controller_commands', 'outputs', 'usb_transport'],
 }

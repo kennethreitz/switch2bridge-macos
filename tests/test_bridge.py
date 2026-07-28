@@ -408,3 +408,77 @@ if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")
     sys.exit(1)
 print("ALL TESTS PASSED")
+
+# ============ auto-connect ============
+print("== auto connect ==")
+import usb_transport as _ut
+
+class FakeApp:
+    """Exercises _maybe_auto_connect without building a real menubar app."""
+    _maybe_auto_connect = S2B.Switch2BridgeApp._maybe_auto_connect
+    def __init__(self, mappings, wired):
+        self.mappings = mappings
+        self.connects = 0
+        self._auto_retry_after = 0.0
+        self._auto_bluetooth_tried = False
+        self._auto_attempt = False
+        self._idle_note = "stale"
+        self._wired = wired
+        self.bridge = self
+    def connect(self):
+        self.connects += 1
+    def _bluetooth_ready(self):
+        return True
+
+_orig = _ut.is_connected
+m_auto = M(); m_auto._apply(json.loads(json.dumps(M.DEFAULT)))
+check("auto_connect on by default", m_auto.auto_connect is True)
+
+# wired present: connects, then backs off rather than looping
+_ut.is_connected = lambda: True
+app = FakeApp(m_auto, True)
+app._maybe_auto_connect()
+check("wired -> auto connects", app.connects == 1)
+check("auto attempt flagged", app._auto_attempt is True)
+check("idle note cleared", app._idle_note is None)
+app._maybe_auto_connect()
+check("backs off, no second attempt", app.connects == 1)
+app._auto_retry_after = 0.0
+app._maybe_auto_connect()
+check("retries wired after the backoff", app.connects == 2)
+
+# no cable: bluetooth gets exactly one attempt per launch
+_ut.is_connected = lambda: False
+app2 = FakeApp(m_auto, False)
+app2._maybe_auto_connect()
+check("no cable -> one bluetooth attempt", app2.connects == 1)
+app2._auto_retry_after = 0.0
+app2._maybe_auto_connect()
+check("bluetooth not retried in a loop", app2.connects == 1)
+
+# but plugging in later still works, even after bluetooth was tried
+_ut.is_connected = lambda: True
+app2._auto_retry_after = 0.0
+app2._maybe_auto_connect()
+check("cable after bluetooth attempt still connects", app2.connects == 2)
+
+# disabled in config
+m_off = M()
+cfg_off = json.loads(json.dumps(M.DEFAULT))
+cfg_off["controller"]["auto_connect"] = False
+m_off._apply(cfg_off)
+check("auto_connect:false honoured", m_off.auto_connect is False)
+app3 = FakeApp(m_off, True)
+app3._maybe_auto_connect()
+check("disabled -> never connects", app3.connects == 0)
+
+# bluetooth permission denied must not trigger a dialog-free scan loop
+class DeniedApp(FakeApp):
+    def _bluetooth_ready(self):
+        return False
+_ut.is_connected = lambda: False
+app4 = DeniedApp(m_auto, False)
+app4._maybe_auto_connect()
+check("bluetooth denied -> no attempt", app4.connects == 0)
+
+_ut.is_connected = _orig

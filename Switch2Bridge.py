@@ -71,7 +71,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.5.0"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.6.0"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -137,6 +137,10 @@ class Mappings:
             # Prefer a wired connection when the controller is plugged in:
             # 250 Hz and a 4 ms interval, against 33 Hz / 30 ms over Bluetooth
             "usb": True,
+            # Connect without clicking. A plugged-in controller is picked up
+            # as soon as it appears; Bluetooth gets one search at launch,
+            # since it needs the pair button held anyway.
+            "auto_connect": True,
         },
         "motion": {
             # The Switch 2 IMU layout is not confirmed. Run
@@ -190,6 +194,7 @@ class Mappings:
         self.use_factory_calibration = True
         self.player_light = 1
         self.usb_enabled = True
+        self.auto_connect = True
         self.left_stick = {}
         self.right_stick = {}
         self.dsu_enabled = True
@@ -422,6 +427,7 @@ class Mappings:
             light = 1
         self.player_light = light
         self.usb_enabled = bool(controller.get("usb", True))
+        self.auto_connect = bool(controller.get("auto_connect", True))
 
         keyboard_cfg = cfg.get("keyboard", {})
         if not isinstance(keyboard_cfg, dict):
@@ -908,6 +914,11 @@ class ControllerBridge:
                 self.last_notice = "USB found but unavailable — using Bluetooth"
             return False
 
+        self.calibration.reset()
+        if self.mappings.use_factory_calibration:
+            left, right = transport.read_stick_calibration()
+            if self.calibration.apply_factory(left, right):
+                self.last_notice = "Stick calibration read from controller"
         transport.set_player_light(self.mappings.player_light)
         self.usb = transport
         self.transport = "usb"
@@ -915,7 +926,6 @@ class ControllerBridge:
         self.is_searching = False
         self.is_connecting = False
         self.is_connected = True
-        self.calibration.reset()
         if self.dsu is not None:
             self.dsu.set_connected(True)
         log.info("connected over USB")
@@ -1142,6 +1152,11 @@ class Switch2BridgeApp(rumps.App):
         self._accessibility_checked = False
         # Warn once per connection that nothing is consuming the input
         self._warned_no_consumer = False
+        # Auto-connect bookkeeping: back off after a failure so a missing
+        # controller cannot turn into a scan loop.
+        self._auto_retry_after = 0.0
+        self._auto_bluetooth_tried = False
+        self._auto_attempt = False
         # Short error shown in the dropdown while idle — notifications are
         # unreliable when running from source, the menu is always visible
         self._idle_note = None
@@ -1227,9 +1242,15 @@ class Switch2BridgeApp(rumps.App):
         if self.bridge.last_error:
             err = self.bridge.last_error
             self.bridge.last_error = None
-            log.warning("user-visible bridge error: %s", err)
             self._idle_note = err.splitlines()[0][:70]
-            self._notify("Connection failed", err)
+            if self._auto_attempt:
+                # Nobody asked for this attempt, so do not interrupt them
+                # over it; the menubar still shows what happened.
+                log.info("automatic connect failed: %s", err)
+            else:
+                log.warning("user-visible bridge error: %s", err)
+                self._notify("Connection failed", err)
+            self._auto_attempt = False
 
         if self.bridge.last_notice:
             notice = self.bridge.last_notice
@@ -1246,6 +1267,8 @@ class Switch2BridgeApp(rumps.App):
         state = self._current_state()
         if state != self._last_state:
             self._apply_state(state)
+        if state == 'idle':
+            self._maybe_auto_connect()
         if state == 'idle' and self._idle_note:
             self._detail_item.title = f"   ⚠️ {self._idle_note}"
         elif state == 'connected':
@@ -1281,6 +1304,34 @@ class Switch2BridgeApp(rumps.App):
             else:
                 self._warned_no_consumer = False
 
+    def _maybe_auto_connect(self):
+        """Connect without a click, when that is unambiguous.
+
+        Wired is retried whenever the cable is present: it is instant and
+        needs no permissions. Bluetooth gets a single attempt per launch,
+        because it only works while the pair button is held and repeated
+        scans would just produce repeated failures.
+        """
+        if not self.mappings.auto_connect:
+            return
+        now = time.monotonic()
+        if now < self._auto_retry_after:
+            return
+
+        wired = self.mappings.usb_enabled and usb_transport.is_connected()
+        if not wired and self._auto_bluetooth_tried:
+            return
+        if not wired:
+            self._auto_bluetooth_tried = True
+            if not self._bluetooth_ready():
+                return
+
+        self._auto_retry_after = now + 5.0
+        self._auto_attempt = True
+        self._idle_note = None
+        log.info("auto-connecting (%s)", "usb" if wired else "bluetooth")
+        self.bridge.connect()
+
     # --- actions ---
 
     def _on_action(self, _):
@@ -1289,8 +1340,13 @@ class Switch2BridgeApp(rumps.App):
             if not self._check_bluetooth():
                 return
             self._idle_note = None
+            self._auto_attempt = False
+            self._auto_bluetooth_tried = True   # respect an explicit choice
             self.bridge.connect()
         elif state != 'stopping':
+            # Stop auto-connect from immediately reconnecting what the user
+            # just asked to disconnect.
+            self.mappings.auto_connect = False
             self.bridge.disconnect()
         self._tick(None)
 
@@ -1522,6 +1578,18 @@ class Switch2BridgeApp(rumps.App):
                     "x-apple.systempreferences:com.apple.preference.security"
                     "?Privacy_Accessibility",
                 ])
+
+    def _bluetooth_ready(self):
+        """Silent permission check, for attempts the user did not ask for.
+
+        _check_bluetooth() puts a dialog up, which is right after a click and
+        wrong when we are polling in the background.
+        """
+        try:
+            from CoreBluetooth import CBManager
+            return int(CBManager.authorization()) not in (1, 2)
+        except Exception:
+            return True  # cannot tell; let the scan surface any problem
 
     def _check_bluetooth(self):
         """Return False (and explain) when Bluetooth permission is denied.

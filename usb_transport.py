@@ -25,9 +25,12 @@ Command sequence from TommyWabg/Switch2Connect (GPL-3.0) — used as a
 protocol reference only.
 """
 
+import controller_commands as cc
 import logging
+import sys
 import threading
 import time
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +67,44 @@ INIT_SEQUENCE = (
 
 def player_light_command(pattern):
     return _frame(0x09, 0x07, bytes([pattern & 0x0F]) + bytes(7), length=0x08)
+
+
+def _bundled_libusb():
+    """Path to libusb inside a py2app bundle, if we shipped one.
+
+    pyusb finds libusb through a hardcoded Homebrew path, which is absent on
+    machines without brew. In a bundle we ship the dylib and point pyusb
+    straight at it so wired mode works out of the box.
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    frameworks = Path(sys.executable).resolve().parent.parent / "Frameworks"
+    for name in ("libusb-1.0.0.dylib", "libusb-1.0.dylib"):
+        candidate = frameworks / name
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+_backend = None
+_backend_resolved = False
+
+
+def usb_backend():
+    """pyusb backend, preferring the bundled dylib. None means 'let pyusb try'."""
+    global _backend, _backend_resolved
+    if _backend_resolved:
+        return _backend
+    _backend_resolved = True
+    bundled = _bundled_libusb()
+    if bundled:
+        try:
+            import usb.backend.libusb1
+            _backend = usb.backend.libusb1.get_backend(find_library=lambda _: bundled)
+            log.info("using bundled libusb at %s", bundled)
+        except Exception as e:
+            log.warning("bundled libusb unusable (%s); falling back", e)
+    return _backend
 
 
 def dependencies_available():
@@ -109,7 +150,8 @@ class USBTransport:
         import usb.core
         import usb.util
 
-        device = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
+        device = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID,
+                               backend=usb_backend())
         if device is None:
             self.last_error = (
                 "Controller not visible over USB. Use a data cable — "
@@ -130,6 +172,37 @@ class USBTransport:
             return None
         self._claimed = True
         return device
+
+    def read_stick_calibration(self):
+        """Factory calibration over the same bulk channel the init uses.
+
+        The command frames are transport-agnostic, so this is the identical
+        SPI read the Bluetooth path performs. Call before the reader thread
+        starts; it uses the bulk IN endpoint, not the HID interface.
+        """
+        if self._device is None:
+            return None, None
+
+        def spi(address, length):
+            try:
+                self._device.write(ENDPOINT_OUT,
+                                   cc.spi_read_command(address, length), 1000)
+            except Exception as e:
+                log.warning("USB SPI read failed: %s", e)
+                return None
+            for _attempt in range(4):
+                try:
+                    reply = bytes(self._device.read(ENDPOINT_IN, 96, 500))
+                except Exception:
+                    return None
+                parsed = cc.parse_spi_reply(reply)
+                if parsed and parsed[0] == address:
+                    return parsed[1]
+            return None
+
+        left = cc.decode_stick_block(spi(cc.FACTORY_STICK_LEFT, cc.STICK_BLOCK_LEN))
+        right = cc.decode_stick_block(spi(cc.FACTORY_STICK_RIGHT, cc.STICK_BLOCK_LEN))
+        return left, right
 
     def _run_init(self):
         replies = 0

@@ -71,7 +71,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.7.0"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.8.0"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -562,6 +562,9 @@ class ControllerBridge:
     # Scan window used while watching. Short, so a controller entering
     # pairing mode is picked up quickly and USB is noticed promptly too.
     WATCH_SCAN_TIMEOUT = 3.0
+    # How often to look for a cable while streaming over Bluetooth. Plugging
+    # in should upgrade to wired without making the user reconnect.
+    USB_POLL_INTERVAL = 1.0
     # Upper bound on the whole configure step, so a controller that never
     # answers costs us a moment rather than the connection
     CONFIG_TIMEOUT = 3.0
@@ -580,6 +583,7 @@ class ControllerBridge:
             auto_center=mappings.stick_auto_center,
         )
         self.watching = False      # keep looking instead of giving up
+        self._upgrade_to_usb = False  # cable appeared mid Bluetooth session
         self.usb = None            # USBTransport while wired
         self.transport = None      # "usb" or "ble" once connected
         self.is_connected = False
@@ -857,8 +861,18 @@ class ControllerBridge:
             # connection nor slows down noticing a drop.
             config_task = asyncio.create_task(self._configure_with_timeout(client))
             try:
+                next_usb_poll = time.monotonic() + self.USB_POLL_INTERVAL
                 while not self._stop_event.is_set() and client.is_connected:
                     await asyncio.sleep(0.1)
+                    now = time.monotonic()
+                    if now < next_usb_poll:
+                        continue
+                    next_usb_poll = now + self.USB_POLL_INTERVAL
+                    if self.mappings.usb_enabled and usb_transport.is_connected():
+                        # Wired is 250 Hz against 33 Hz here; take it.
+                        log.info("cable plugged in — upgrading to wired")
+                        self._upgrade_to_usb = True
+                        break
             finally:
                 config_task.cancel()
             return True
@@ -996,6 +1010,14 @@ class ControllerBridge:
 
                 if self._stop_event.is_set():
                     return
+
+                if self._upgrade_to_usb:
+                    # Not a failure: drop the radio link and let the top of
+                    # the loop pick the cable up.
+                    self._upgrade_to_usb = False
+                    self.last_error = None
+                    self.last_notice = "Cable connected — switching to wired"
+                    continue
 
                 if streamed and self.watching:
                     self.is_reconnecting = False

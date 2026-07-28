@@ -493,6 +493,78 @@ check("stop ends the watcher", not br_watch._thread.is_alive())
 check("watching cleared on stop", br_watch.watching is False)
 S2B.INITIAL_SCAN_WINDOW = 10.0
 
+# ============ USB hot-plug during a Bluetooth session ============
+print("== usb hot-plug ==")
+_orig_is_conn = _ut.is_connected
+_orig_transport = _ut.USBTransport
+
+class FakeUSB:
+    """Stands in for a real wired controller."""
+    def __init__(self, on_report, on_error=None):
+        self.connected = False
+    def connect(self):
+        self.connected = True
+        return True
+    def read_stick_calibration(self):
+        return None, None
+    def set_player_light(self, pattern):
+        pass
+    def disconnect(self):
+        self.connected = False
+
+mm_hot = M(); mm_hot._apply(json.loads(json.dumps(M.DEFAULT)))
+MockScanner.queue = []
+MockScanner.result = {"AA:BB": (Dev(), Adv())}
+MockScanner.delay = 0.05
+S2B.INITIAL_SCAN_WINDOW = 10.0
+
+_ut.is_connected = lambda: False          # no cable yet
+_ut.USBTransport = FakeUSB
+br_hot = S2B.ControllerBridge(mm_hot)
+br_hot.connect(watch=True)
+time.sleep(1.2)
+check("bluetooth session established", br_hot.is_connected, br_hot.last_error)
+check("transport is ble", br_hot.transport == "ble", br_hot.transport)
+
+_ut.is_connected = lambda: True           # cable goes in mid-session
+time.sleep(2.5)
+check("upgraded to wired", br_hot.transport == "usb", br_hot.transport)
+check("still connected across the switch", br_hot.is_connected)
+check("explained as an upgrade, not a failure",
+      "wired" in (br_hot.last_notice or "").lower(), br_hot.last_notice)
+check("no error raised for the switch", br_hot.last_error is None, br_hot.last_error)
+br_hot.disconnect(wait=True, timeout=3.0)
+
+# a cable that cannot actually be claimed must not strand the user
+class DeadUSB(FakeUSB):
+    def connect(self):
+        self.last_error = "nope"
+        return False
+_ut.USBTransport = DeadUSB
+br_fall = S2B.ControllerBridge(mm_hot)
+br_fall.connect(watch=True)
+time.sleep(2.5)
+check("falls back to bluetooth when the cable cannot be claimed",
+      br_fall.is_connected and br_fall.transport == "ble", br_fall.transport)
+br_fall.disconnect(wait=True, timeout=3.0)
+
+# with usb disabled the bluetooth session is left alone
+_ut.USBTransport = FakeUSB
+mm_no_usb = M()
+cfg_nu = json.loads(json.dumps(M.DEFAULT)); cfg_nu["controller"]["usb"] = False
+mm_no_usb._apply(cfg_nu)
+br_stay = S2B.ControllerBridge(mm_no_usb)
+br_stay.connect(watch=True)
+time.sleep(1.2)
+check("session up with usb disabled", br_stay.is_connected, br_stay.last_error)
+time.sleep(1.6)
+check("cable ignored when usb is off",
+      br_stay.is_connected and br_stay.transport == "ble", br_stay.transport)
+br_stay.disconnect(wait=True, timeout=3.0)
+
+_ut.is_connected = _orig_is_conn
+_ut.USBTransport = _orig_transport
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} -> {FAILURES}")

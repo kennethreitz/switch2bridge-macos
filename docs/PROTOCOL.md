@@ -113,6 +113,105 @@ Report ID 0x02  Output  63 bytes
 
 The 21 buttons match the byte 2/3/4 bitfield documented by darthcloud exactly, and the 4x12-bit axes confirm the stick packing.
 
+## There is no Bluetooth Classic mode
+
+The controller advertises `Flags = 0x06`:
+
+```
+bit 1  LE General Discoverable
+bit 2  BR/EDR NOT supported          <- set
+bit 3  Simultaneous LE + BR/EDR      <- clear
+bit 4  Simultaneous LE + BR/EDR      <- clear
+```
+
+Read from the advertiser carrying Nintendo company ID `0x0553` with
+`VID 057e / PID 2069` in its manufacturer data, so it is definitely the
+Pro 2 and not a neighbour in the open-air capture.
+
+**It is a BLE-only device.** No command can put it into a standard Bluetooth
+HID mode, because the radio does not have one.
+
+Two consequences:
+
+* macOS's built-in "Switch Pro Controller" support is for the *Switch 1*
+  Pro, a Bluetooth Classic HID device. That path does not apply here.
+* Even over BLE the controller uses proprietary GATT services
+  (`ab7de9be-...`, `00c5af5d-...`) rather than the standard HID-over-GATT
+  profile (`0x1812`), so there is no generic path either. This is why it
+  never appears in System Settings.
+
+The Switch 2 console also connects over **BLE**, not Bluetooth Classic — the
+sniffer captures show `CONNECT_IND` and ATT traffic. A console reclaiming
+the controller is ordinary BLE reconnection to an advertising peripheral,
+not a second parallel radio link.
+
+## Connection interval: 15 ms on the console, 30 ms on macOS
+
+From an nRF sniffer capture of a real Switch 2 pairing with a Pro 2, the
+`CONNECT_IND` specifies:
+
+```
+interval = 15.00 ms   latency = 0   timeout = 2000 ms
+```
+
+Confirmed independently by packet timing in the same capture — the dominant
+inter-event gap is 14.8 ms. No `LL_CONNECTION_UPDATE_IND` appears anywhere,
+so it never changes after connecting.
+
+macOS negotiates **30 ms** instead: ~33 Hz against the console's ~66 Hz. The
+controller sends exactly one report per connection event on both transports
+— the byte-0 counter increments by 1 every time, over 2454 BLE and 499 USB
+transitions — so the report rate *is* the connection interval. The
+controller adapts to the transport rather than dropping packets.
+
+**This cannot be changed from the controller side.** The full console init
+sequence below was replayed over BLE, every command acknowledged, and the
+rate stayed at exactly 33 Hz / 30 ms. The interval is chosen by the central
+before any command is sent, and CoreBluetooth exposes no API to influence
+it. 15 ms is Apple's documented minimum for peripheral-requested
+parameters, so the controller would likely be granted it — but it publishes
+no Peripheral Preferred Connection Parameters characteristic and never sends
+a connection parameter update request.
+
+Use USB if latency matters: 250 Hz / 4 ms.
+
+## The console's own BLE init sequence
+
+Extracted from darthcloud's decrypted OTA capture
+(`sw2_pro2_reconn_sc2_rumble_crackle.pcap`). This is what a real Switch 2
+sends, in order, to ATT handle `0x0016`. The transport byte is `01`
+throughout, and the console reads input from handle `0x000e`
+(`7492866c-...f8`) rather than `...f9`.
+
+```
+07 91 01 01 00 00 00 00                            status
+02 91 01 04 00 08 00 00 40 7e 00 00 00 30 01 00    SPI read 0x00013000, 0x40 bytes
+10 91 01 01 00 00 00 00                            unknown; replies 02 01 04 02
+16 91 01 01 00 00 00 00                            unknown
+0a 91 01 02 00 04 00 00 03 00 00 00                report config
+09 91 01 07 00 08 00 00 01 ...                     player LED
+0c 91 01 02 00 04 00 00 27 00 00 00                feature mask
+02 91 01 04 ...  SPI 0x00013080 / 0x000130c0 / 0x001fc040 / 0x00013040 / 0x00013100
+11 91 01 03 00 00 00 00                            unknown; replies 01 20 03 00
+02 91 01 04 ...  SPI 0x00013060
+0a 91 01 08 00 14 00 00 01 ff ff ff ff ff ff ff    vibration config
+11 91 01 01 00 00 00 00                            unknown; replies 01 00 00 00
+0c 91 01 04 00 04 00 00 27 00 00 00                enable features
+```
+
+Replaying this verbatim did **not** make `...f8` or `...fd2` start streaming
+for us, and did not enable motion. `tools/replay_console_init.py` reproduces
+the experiment.
+
+## Still unsolved
+
+* **Motion / gyro** — the extended report payload does not decode as motion.
+  Possibly encrypted
+* **Exiting pairing mode** — the controller keeps advertising, so a nearby
+  console reconnects to it. Wired sidesteps it entirely
+* **Rumble** — not attempted here; Switch2Connect has Pro 2 rumble working
+* **Battery level** — not located in the report
+
 ---
 
 Credit where due: the ATT table, command framing and LED payload documented by darthcloud are what made any of this possible, and TommyWabg's Switch2Connect was the reference for the verified USB init byte sequences. Thanks to @darthcloud and @german77.

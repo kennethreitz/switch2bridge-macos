@@ -323,3 +323,8 @@ switch2bridge-macos/
 ## 📜 Credits
 
 - **Aurélien Desert** — reverse engineering & implementation
+
+## 📚 Protocol notes
+
+See [docs/PROTOCOL.md](docs/PROTOCOL.md) for hardware-verified findings on the
+BLE and USB protocols, stick calibration, and what is still unsolved.

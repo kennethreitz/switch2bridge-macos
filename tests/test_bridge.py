@@ -403,82 +403,98 @@ m4.set_dsu_enabled(False)
 check("corrupt file untouched", S2B.MAPPINGS_FILE.read_text() == "{broken json")
 check("in-memory toggle still applied", m4.dsu_enabled is False)
 
-print()
-if FAILURES:
-    print(f"FAILED: {len(FAILURES)} -> {FAILURES}")
-    sys.exit(1)
-print("ALL TESTS PASSED")
 
-# ============ auto-connect ============
+# ============ auto-connect / watching ============
 print("== auto connect ==")
 import usb_transport as _ut
 
 class FakeApp:
     """Exercises _maybe_auto_connect without building a real menubar app."""
     _maybe_auto_connect = S2B.Switch2BridgeApp._maybe_auto_connect
-    def __init__(self, mappings, wired):
+    def __init__(self, mappings, bluetooth_ready=True):
         self.mappings = mappings
-        self.connects = 0
+        self.calls = []
         self._auto_retry_after = 0.0
-        self._auto_bluetooth_tried = False
         self._auto_attempt = False
         self._idle_note = "stale"
-        self._wired = wired
+        self._bt_ready = bluetooth_ready
         self.bridge = self
-    def connect(self):
-        self.connects += 1
+    def connect(self, watch=False):
+        self.calls.append(watch)
     def _bluetooth_ready(self):
-        return True
+        return self._bt_ready
 
 _orig = _ut.is_connected
 m_auto = M(); m_auto._apply(json.loads(json.dumps(M.DEFAULT)))
 check("auto_connect on by default", m_auto.auto_connect is True)
 
-# wired present: connects, then backs off rather than looping
-_ut.is_connected = lambda: True
-app = FakeApp(m_auto, True)
-app._maybe_auto_connect()
-check("wired -> auto connects", app.connects == 1)
-check("auto attempt flagged", app._auto_attempt is True)
-check("idle note cleared", app._idle_note is None)
-app._maybe_auto_connect()
-check("backs off, no second attempt", app.connects == 1)
-app._auto_retry_after = 0.0
-app._maybe_auto_connect()
-check("retries wired after the backoff", app.connects == 2)
-
-# no cable: bluetooth gets exactly one attempt per launch
+# the point of the feature: one watcher covering both transports
 _ut.is_connected = lambda: False
-app2 = FakeApp(m_auto, False)
-app2._maybe_auto_connect()
-check("no cable -> one bluetooth attempt", app2.connects == 1)
-app2._auto_retry_after = 0.0
-app2._maybe_auto_connect()
-check("bluetooth not retried in a loop", app2.connects == 1)
+app = FakeApp(m_auto)
+app._maybe_auto_connect()
+check("starts a watcher", app.calls == [True], app.calls)
+check("idle note cleared", app._idle_note is None)
 
-# but plugging in later still works, even after bluetooth was tried
+# and it does not stack watchers on top of each other
+app._maybe_auto_connect()
+check("backs off rather than restarting", app.calls == [True], app.calls)
+
+# wired needs no Bluetooth permission at all
 _ut.is_connected = lambda: True
-app2._auto_retry_after = 0.0
+app2 = FakeApp(m_auto, bluetooth_ready=False)
 app2._maybe_auto_connect()
-check("cable after bluetooth attempt still connects", app2.connects == 2)
+check("wired watched even with bluetooth denied", app2.calls == [True], app2.calls)
+
+# wireless with permission denied should back off, not spin
+_ut.is_connected = lambda: False
+app3 = FakeApp(m_auto, bluetooth_ready=False)
+app3._maybe_auto_connect()
+check("bluetooth denied -> no watcher", app3.calls == [], app3.calls)
+check("bluetooth denied -> explains why", "permission" in (app3._idle_note or "").lower(),
+      app3._idle_note)
+check("bluetooth denied -> long backoff", app3._auto_retry_after > 0)
 
 # disabled in config
-m_off = M()
 cfg_off = json.loads(json.dumps(M.DEFAULT))
 cfg_off["controller"]["auto_connect"] = False
-m_off._apply(cfg_off)
+m_off = M(); m_off._apply(cfg_off)
 check("auto_connect:false honoured", m_off.auto_connect is False)
-app3 = FakeApp(m_off, True)
-app3._maybe_auto_connect()
-check("disabled -> never connects", app3.connects == 0)
-
-# bluetooth permission denied must not trigger a dialog-free scan loop
-class DeniedApp(FakeApp):
-    def _bluetooth_ready(self):
-        return False
-_ut.is_connected = lambda: False
-app4 = DeniedApp(m_auto, False)
+app4 = FakeApp(m_off)
 app4._maybe_auto_connect()
-check("bluetooth denied -> no attempt", app4.connects == 0)
+check("disabled -> never watches", app4.calls == [], app4.calls)
 
 _ut.is_connected = _orig
+
+# ============ watch mode keeps looking instead of erroring ============
+print("== watch mode ==")
+S2B.INITIAL_SCAN_WINDOW = 0.0        # would normally give up immediately
+MockScanner.queue = []
+MockScanner.result = {}              # nothing to find
+MockScanner.delay = 0.05
+br_watch = S2B.ControllerBridge(mm)
+br_watch.connect(watch=True)
+time.sleep(1.2)
+check("watching -> still running after the window", br_watch._thread.is_alive())
+check("watching -> no 'not found' error", br_watch.last_error is None, br_watch.last_error)
+check("watching flag set", br_watch.watching is True)
+
+# controller enters pairing mode: it should be picked up without a click
+MockScanner.result = {"AA:BB": (Dev(), Adv())}
+time.sleep(1.5)
+check("connects once it starts advertising", br_watch.is_connected, br_watch.last_error)
+
+# it sleeps again -> back to watching, not an error
+MockClient.instances[-1]._connected = False
+time.sleep(1.0)
+check("drop -> keeps watching", br_watch._thread.is_alive() and not br_watch.last_error,
+      br_watch.last_error)
+br_watch.disconnect(wait=True, timeout=3.0)
+check("stop ends the watcher", not br_watch._thread.is_alive())
+check("watching cleared on stop", br_watch.watching is False)
+S2B.INITIAL_SCAN_WINDOW = 10.0
+
+print()
+if FAILURES:
+    print(f"FAILED: {len(FAILURES)} -> {FAILURES}")
+    sys.exit(1)
+print("ALL TESTS PASSED")

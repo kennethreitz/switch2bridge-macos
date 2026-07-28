@@ -71,7 +71,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.6.0"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.7.0"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -559,6 +559,9 @@ class ControllerBridge:
     )
 
     MIN_REPORT_LEN = 11
+    # Scan window used while watching. Short, so a controller entering
+    # pairing mode is picked up quickly and USB is noticed promptly too.
+    WATCH_SCAN_TIMEOUT = 3.0
     # Upper bound on the whole configure step, so a controller that never
     # answers costs us a moment rather than the connection
     CONFIG_TIMEOUT = 3.0
@@ -576,6 +579,7 @@ class ControllerBridge:
             half_range=mappings.stick_half_range,
             auto_center=mappings.stick_auto_center,
         )
+        self.watching = False      # keep looking instead of giving up
         self.usb = None            # USBTransport while wired
         self.transport = None      # "usb" or "ble" once connected
         self.is_connected = False
@@ -963,9 +967,16 @@ class ControllerBridge:
                     self.last_notice = "USB disconnected — searching Bluetooth"
                     continue
                 try:
-                    address, name = await self._find_controller()
+                    address, name = await self._find_controller(
+                        self.WATCH_SCAN_TIMEOUT if self.watching else SCAN_TIMEOUT
+                    )
                 except Exception as e:
                     log.exception("BLE scan failed")
+                    if self.watching and not self._bluetooth_fatal(e):
+                        # Bluetooth off, or busy: keep watching rather than
+                        # ending a session the user never started.
+                        await asyncio.sleep(2.0)
+                        continue
                     self.last_error = self._scan_error_message(e)
                     return
 
@@ -986,6 +997,12 @@ class ControllerBridge:
                 if self._stop_event.is_set():
                     return
 
+                if streamed and self.watching:
+                    self.is_reconnecting = False
+                    self.last_notice = "Controller disconnected — still watching"
+                    log.info("connection dropped; back to watching")
+                    continue
+
                 if streamed:
                     # Unexpected drop (controller slept, went out of range…):
                     # retry for RECONNECT_WINDOW before giving up.
@@ -997,8 +1014,19 @@ class ControllerBridge:
                     continue
 
                 if address and not was_connected:
+                    if self.watching:
+                        # Seen but not connectable yet — it is probably still
+                        # settling into pairing mode. Keep waiting.
+                        self.last_error = None
+                        await asyncio.sleep(1.0)
+                        continue
                     # Found it but couldn't connect — surface and stop.
                     return
+
+                if self.watching:
+                    was_connected = False   # a fresh pairing, not a reconnect
+                    await asyncio.sleep(0.5)
+                    continue
 
                 if time.monotonic() > deadline:
                     self.last_error = (
@@ -1019,6 +1047,7 @@ class ControllerBridge:
         finally:
             self.is_searching = False
             self.is_reconnecting = False
+            self.watching = False
 
     # --- public API ---
 
@@ -1030,9 +1059,16 @@ class ControllerBridge:
             and self._thread.is_alive()
         )
 
-    def connect(self):
+    @staticmethod
+    def _bluetooth_fatal(exc):
+        """Only a permission problem is worth giving up over."""
+        text = str(exc).lower()
+        return "unauthorized" in text or "not authorized" in text or "denied" in text
+
+    def connect(self, watch=False):
         if self._thread and self._thread.is_alive():
             return
+        self.watching = watch
         self._stop_event.clear()
         self.last_error = None
         self.last_notice = None
@@ -1177,11 +1213,18 @@ class Switch2BridgeApp(rumps.App):
         if self.bridge.is_connecting:
             return 'connecting'
         if self.bridge.is_searching:
-            return 'searching'
+            # Watching is the resting state, not an operation in progress
+            return 'watching' if self.bridge.watching else 'searching'
         return 'idle'
 
     def _apply_state(self, state):
-        if state == 'searching':
+        if state == 'watching':
+            self.title = "🎮"
+            self._status_item.title = "Waiting for controller…"
+            self._detail_item.title = "   Hold the pair button, or plug in USB"
+            self._action_item.title = "Stop waiting"
+            self._action_item.set_callback(self._on_action)
+        elif state == 'searching':
             self.title = "🔍"
             self._status_item.title = "Searching…"
             self._detail_item.title = " "
@@ -1269,6 +1312,8 @@ class Switch2BridgeApp(rumps.App):
             self._apply_state(state)
         if state == 'idle':
             self._maybe_auto_connect()
+        elif state == 'watching':
+            self._auto_attempt = False   # it is running; nothing pending
         if state == 'idle' and self._idle_note:
             self._detail_item.title = f"   ⚠️ {self._idle_note}"
         elif state == 'connected':
@@ -1305,32 +1350,29 @@ class Switch2BridgeApp(rumps.App):
                 self._warned_no_consumer = False
 
     def _maybe_auto_connect(self):
-        """Connect without a click, when that is unambiguous.
+        """Start watching for the controller, and stay watching.
 
-        Wired is retried whenever the cable is present: it is instant and
-        needs no permissions. Bluetooth gets a single attempt per launch,
-        because it only works while the pair button is held and repeated
-        scans would just produce repeated failures.
+        One background task covers both transports: it polls USB and scans
+        for a controller in pairing mode, connecting to whichever appears.
+        There is nothing to click and nothing to retry — pressing the pair
+        button or plugging in the cable is the whole interaction.
         """
         if not self.mappings.auto_connect:
             return
         now = time.monotonic()
         if now < self._auto_retry_after:
             return
-
-        wired = self.mappings.usb_enabled and usb_transport.is_connected()
-        if not wired and self._auto_bluetooth_tried:
+        # Only Bluetooth needs permission; a wired controller does not.
+        if not usb_transport.is_connected() and not self._bluetooth_ready():
+            self._auto_retry_after = now + 30.0
+            self._idle_note = "Bluetooth permission needed for wireless"
             return
-        if not wired:
-            self._auto_bluetooth_tried = True
-            if not self._bluetooth_ready():
-                return
 
         self._auto_retry_after = now + 5.0
         self._auto_attempt = True
         self._idle_note = None
-        log.info("auto-connecting (%s)", "usb" if wired else "bluetooth")
-        self.bridge.connect()
+        log.info("watching for controller (usb + bluetooth)")
+        self.bridge.connect(watch=True)
 
     # --- actions ---
 

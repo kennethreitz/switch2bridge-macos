@@ -2,7 +2,7 @@
 
 **The first working Bluetooth LE client for the Nintendo Switch 2 Pro Controller on macOS.**
 
-A Python menubar app that connects to the Switch 2 Pro Controller over BLE and exposes it to emulators as a **real analog gamepad** via the DSU (cemuhook) protocol — no driver, no kext, no permissions.
+A Python menubar app that connects to the Switch 2 Pro Controller — **wired or over Bluetooth LE** — and exposes it to emulators as a **real analog gamepad** via the DSU (cemuhook) protocol. No driver, no kext, no permissions.
 
 [![CI](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml)
 [![macOS](https://img.shields.io/badge/macOS-Ventura%2B-blue?logo=apple)](https://www.apple.com/macos)
@@ -29,6 +29,9 @@ A Python menubar app that connects to the Switch 2 Pro Controller over BLE and e
 - ✅ **Full button mapping** — all buttons, triggers, D-pad, verified against a real capture
 - ✅ **Grip buttons** — Switch 2 exclusive GL/GR, plus the new C button
 - ✅ **No pairing required** — bypasses macOS Bluetooth limitations
+- ✅ **Wired mode** — 250 Hz / 4 ms over USB, against 33 Hz / 30 ms on Bluetooth
+- ✅ **Auto-connect** — picks up a plugged-in controller at launch, no clicking
+- ✅ **Factory stick calibration** — read from the controller's own flash, per unit
 - ✅ **Auto-reconnect** — if the controller sleeps or drops, the bridge retries
 - ✅ **Zero permissions by default** — DSU needs neither Accessibility nor anything else
 - ✅ **Legacy keyboard bridge** — still there, opt-in, for keyboard-only emulators
@@ -39,17 +42,23 @@ A Python menubar app that connects to the Switch 2 Pro Controller over BLE and e
 
 The Nintendo Switch 2 Pro Controller (Product ID: `0x2069`) doesn't work with macOS natively:
 
-| Method | Status | Problem |
-|--------|--------|---------|
-| USB | ❌ | Firmware blocks non-Switch connections |
-| Bluetooth Classic | ❌ | macOS can't discover/pair with it |
-| Bluetooth LE | ✅ | Works with custom BLE client (this project) |
+| Method | Status | Notes |
+|--------|--------|-------|
+| USB | ✅ | Enumerates, but stays silent until an init sequence is sent to its **vendor-class interface** — not the HID one. This project does that: 250 Hz, 4 ms |
+| Bluetooth Classic | ❌ | macOS can't discover or pair with it |
+| Bluetooth LE | ✅ | Works with a custom BLE client. 33 Hz, 30 ms connection interval |
+
+Wired is used automatically when the cable is plugged in, since it is ~7×
+faster and the console cannot steal the controller back over Bluetooth
+Classic while it is wired. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## 📋 Requirements
 
 - macOS Ventura (13.0) or later
 - Python 3.9+
 - Nintendo Switch 2 Pro Controller
+- For wired mode from source: `brew install libusb` (the bundled `.app`
+  ships its own copy, so the DMG needs nothing extra)
 
 ## 🔧 Run from source
 
@@ -85,7 +94,9 @@ python setup_app.py py2app
 ## 🎯 Usage
 
 1. Launch the app — a 🎮 appears in the menu bar
-2. Click → **Connect Controller**
+2. **Plugged in?** It connects by itself within a second
+   **Wireless?** Click **Connect Controller**, then hold the pair button on the
+   back until the LEDs sweep
 3. Wait for 🟢 (connected). The DSU server is already listening on `127.0.0.1:26760`
 4. Point your emulator at it:
 

@@ -21,6 +21,8 @@ import threading
 import time
 import zlib
 
+from controller_state import monotonic_us
+
 log = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1001
@@ -196,7 +198,7 @@ class DSUServer:
             0xFF if buttons.get(name) else 0 for name in _ANALOG_ORDER
         )
         payload += b"\x00" * 12  # two (inactive) touch structs
-        timestamp = state.timestamp_us or (time.monotonic_ns() // 1000)
+        timestamp = state.timestamp_us or monotonic_us()
         payload += struct.pack("<Q", timestamp)
         ax, ay, az = state.accel
         gp, gy, gr = state.gyro

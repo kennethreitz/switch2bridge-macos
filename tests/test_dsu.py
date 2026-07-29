@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import dsu_server as D
-from controller_state import ControllerState
+from controller_state import ControllerState, monotonic_us
 from dsu_server import DSUServer
 
 
@@ -136,6 +136,12 @@ check("data: analog others zero", analog[0] == 0 and analog[4] == 0)
 
 ts = struct.unpack_from("<Q", pkt, 68)[0]
 check("data: motion timestamp set", ts > 0)
+# Clients measure the hop by subtracting this stamp from their own clock, so
+# it has to sit on the machine-wide uptime clock. time.monotonic() would pass
+# the check above and still be hours away from what the client reads.
+age_us = monotonic_us() - ts
+check("data: motion timestamp on the shared uptime clock",
+      0 <= age_us < 1_000_000, (ts, age_us))
 floats = struct.unpack_from("<6f", pkt, 76)
 check("data: motion zeroed", all(f == 0.0 for f in floats))
 

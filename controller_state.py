@@ -11,8 +11,25 @@ never reach into raw bytes.
 import logging
 import math
 import statistics
+import time
 
 log = logging.getLogger(__name__)
+
+# DSU clients compare the stamp on a packet against their own clock to
+# measure the hop, so it has to be a clock both processes agree on.
+# CLOCK_UPTIME_RAW is nanoseconds since boot — the same thing
+# mach_absolute_time reads, and so the same thing Swift's
+# DispatchTime.uptimeNanoseconds reports. time.monotonic() is *not* usable
+# here: on macOS its reference point is the start of the calling process,
+# so two processes reading it get numbers hours apart.
+_UPTIME_CLOCK = getattr(time, 'CLOCK_UPTIME_RAW', None)
+
+
+def monotonic_us():
+    """Microseconds on a clock other processes on this machine can read."""
+    if _UPTIME_CLOCK is not None:
+        return time.clock_gettime_ns(_UPTIME_CLOCK) // 1000
+    return time.monotonic_ns() // 1000
 
 # Every button the Switch 2 Pro Controller reports, in a stable order.
 # GL/GR are the Switch 2 grip buttons, C is the new Switch 2 button.

@@ -52,6 +52,7 @@ from controller_state import (
     BUTTON_NAMES,
     ControllerState,
     StickCalibration,
+    monotonic_us,
     shape_stick,
 )
 import controller_commands as cc
@@ -750,7 +751,7 @@ class ControllerBridge:
         return ControllerState(
             buttons=buttons, lx=lx, ly=ly, rx=rx, ry=ry,
             accel=accel, gyro=gyro,
-            timestamp_us=time.monotonic_ns() // 1000,
+            timestamp_us=monotonic_us(),
         )
 
     def _on_data(self, sender, data: bytes):

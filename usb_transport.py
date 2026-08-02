@@ -133,6 +133,10 @@ class USBTransport:
     stripped, so it matches the Bluetooth payload exactly.
     """
 
+    # Frames to keep sending after an effect ends. One dropped stop frame would
+    # otherwise leave the motors running until the next effect.
+    RUMBLE_TRAILING_FRAMES = 3
+
     def __init__(self, on_report, on_error=None):
         self.on_report = on_report
         self.on_error = on_error
@@ -143,6 +147,14 @@ class USBTransport:
         self._claimed = False
         self._stop = threading.Event()
         self._thread = None
+        # Rumble runs on its own thread: the motors decay unless refreshed every
+        # few milliseconds, which is not something the caller should have to do.
+        self._rumble = (0, 0)
+        self._rumble_seq = 0
+        self._rumble_lock = threading.Lock()
+        self._rumble_wake = threading.Event()
+        self._rumble_thread = None
+        self._write_lock = threading.Lock()
 
     # --- lifecycle ---
 
@@ -256,9 +268,64 @@ class USBTransport:
         self._thread = threading.Thread(target=self._read_loop,
                                         name="usb-reader", daemon=True)
         self._thread.start()
+        self._rumble_thread = threading.Thread(target=self._rumble_loop,
+                                               name="usb-rumble", daemon=True)
+        self._rumble_thread.start()
         self.connected = True
         log.info("USB transport connected")
         return True
+
+    # --- rumble ---
+
+    def set_rumble(self, low_amplitude, high_amplitude):
+        """Drive both actuators, 0-65535 each. Zero on both stops them.
+
+        Returns immediately; the effect is held by a background thread until
+        it is changed or cleared, because the motors decay if the report is
+        not repeated.
+        """
+        pair = (max(0, min(0xFFFF, int(low_amplitude))),
+                max(0, min(0xFFFF, int(high_amplitude))))
+        with self._rumble_lock:
+            if pair == self._rumble:
+                return
+            self._rumble = pair
+        self._rumble_wake.set()
+
+    def _write_report(self, report):
+        with self._write_lock:
+            handle = self._hid
+            if handle is None:
+                return False
+            try:
+                handle.write(report)
+                return True
+            except Exception as e:
+                log.warning("USB rumble write failed: %s", e)
+                return False
+
+    def _rumble_loop(self):
+        """Repeat the current effect, and stop cleanly when it ends."""
+        trailing = 0
+        while not self._stop.is_set():
+            with self._rumble_lock:
+                low, high = self._rumble
+            if low or high:
+                trailing = self.RUMBLE_TRAILING_FRAMES
+            elif trailing > 0:
+                trailing -= 1     # a few explicit zero frames, then go quiet
+            else:
+                # Idle: block until something changes rather than spinning at
+                # 80 Hz writing zeros nobody asked for.
+                self._rumble_wake.wait(0.5)
+                self._rumble_wake.clear()
+                continue
+            self._rumble_seq += 1
+            if not self._write_report(
+                cc.rumble_report(low, high, self._rumble_seq)
+            ):
+                return
+            time.sleep(cc.RUMBLE_RESEND_INTERVAL)
 
     def set_player_light(self, pattern):
         if self._device is None:
@@ -301,16 +368,28 @@ class USBTransport:
                 pass
 
     def disconnect(self):
-        self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(1.0)
-        self._thread = None
+        # Silence the motors first. Dropping the handle mid-effect would leave
+        # the controller buzzing with nothing left to tell it to stop.
+        with self._rumble_lock:
+            self._rumble = (0, 0)
         if self._hid is not None:
-            try:
-                self._hid.close()
-            except Exception:
-                pass
-            self._hid = None
+            self._rumble_seq += 1
+            self._write_report(cc.rumble_report(0, 0, self._rumble_seq))
+
+        self._stop.set()
+        self._rumble_wake.set()
+        for thread in (self._thread, self._rumble_thread):
+            if thread and thread.is_alive():
+                thread.join(1.0)
+        self._thread = None
+        self._rumble_thread = None
+        with self._write_lock:
+            if self._hid is not None:
+                try:
+                    self._hid.close()
+                except Exception:
+                    pass
+                self._hid = None
         if self._device is not None and self._claimed:
             try:
                 import usb.util

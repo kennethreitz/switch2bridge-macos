@@ -77,6 +77,69 @@ def parse_spi_reply(reply):
     return address, reply[FRAME_LEN:FRAME_LEN + length]
 
 
+# --- HD rumble ---
+#
+# Rumble is the mirror image of the command channel. Commands only work on the
+# vendor interface and are silently ignored as HID output reports; rumble only
+# works as a HID output report and is *acknowledged* but ignored when sent as
+# command 0x0A/0x08 on the vendor interface. Verified on hardware both ways
+# round — the ACK for the vendor-interface version is what makes it misleading.
+
+RUMBLE_REPORT_ID = 0x02
+RUMBLE_REPORT_LEN = 64
+# Carrier frequencies for the two actuators. These are what SDL settled on.
+RUMBLE_HIGH_FREQ = 0x187
+RUMBLE_LOW_FREQ = 0x112
+# Amplitude is clamped well below full scale. SDL's comment is worth repeating:
+# the motors are strong enough that it is "a game controller, not a massage
+# device", and driving them flat out may not be good for the hardware.
+RUMBLE_MAX_AMPLITUDE = 29000
+# The motors stop on their own if not refreshed, so an active effect has to be
+# re-sent at roughly this interval for as long as it should be felt.
+RUMBLE_RESEND_INTERVAL = 0.012
+# Offset of the right actuator's block; it mirrors the left one byte for byte.
+_RUMBLE_RIGHT_OFFSET = 0x11
+
+
+def scale_amplitude(amplitude):
+    """A 0-65535 amplitude mapped into the range the motors are driven at."""
+    clamped = max(0, min(0xFFFF, int(amplitude)))
+    return (clamped * RUMBLE_MAX_AMPLITUDE) // 0xFFFF
+
+
+def encode_hd_rumble(high_amplitude, low_amplitude,
+                     high_freq=RUMBLE_HIGH_FREQ, low_freq=RUMBLE_LOW_FREQ):
+    """One five-byte HD rumble frame.
+
+    Two frequency/amplitude pairs bit-packed together: 12-bit frequencies and
+    10-bit amplitudes straddling byte boundaries, so every byte carries parts
+    of more than one field.
+    """
+    return bytes([
+        high_freq & 0xFF,
+        ((high_amplitude >> 4) & 0xFC) | ((high_freq >> 8) & 0x03),
+        ((high_amplitude >> 12) | (low_freq << 4)) & 0xFF,
+        (low_amplitude & 0xC0) | ((low_freq >> 4) & 0x3F),
+        (low_amplitude >> 8) & 0xFF,
+    ])
+
+
+def rumble_report(low_amplitude, high_amplitude, sequence):
+    """USB HID output report 0x02 driving both actuators.
+
+    Amplitudes are 0-65535 and get scaled down here, so callers work in the
+    same units DSU and SDL use. Zero on both stops the motors.
+    """
+    body = bytearray(RUMBLE_REPORT_LEN)
+    body[0] = RUMBLE_REPORT_ID
+    body[1] = 0x50 | (sequence & 0x0F)
+    body[2:7] = encode_hd_rumble(scale_amplitude(high_amplitude),
+                                 scale_amplitude(low_amplitude))
+    # Right actuator repeats the left block, sequence byte included.
+    body[_RUMBLE_RIGHT_OFFSET:_RUMBLE_RIGHT_OFFSET + 6] = body[1:7]
+    return bytes(body)
+
+
 def unpack_pair(chunk):
     """Three bytes -> two 12-bit values, same packing the sticks use."""
     return (chunk[0] | ((chunk[1] & 0x0F) << 8),

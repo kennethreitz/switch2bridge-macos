@@ -255,6 +255,94 @@ srv.push(state({"GL": 1, "C": 1}))
 pkt, _ = cli.recvfrom(1024)
 check("alias: unmapped GL/C emit nothing", pkt[37] == 0 and pkt[38] == 0)
 
+# ============ rumble ============
+# DSU's rumble messages are an unofficial extension, so the wire format is
+# worth pinning: a client that does speak it must not be answered with
+# nonsense, and a client that dies mid-effect must not leave the pad buzzing.
+print("== rumble ==")
+import controller_commands as CC
+
+# The encoding itself, independent of any transport.
+frame = CC.encode_hd_rumble(0, 0, high_freq=0x187, low_freq=0x112)
+check("hd frame is 5 bytes", len(frame) == 5, len(frame))
+check("hd frame carries the high frequency low byte", frame[0] == 0x87, hex(frame[0]))
+report = CC.rumble_report(0, 0, 0)
+check("rumble report is 64 bytes", len(report) == CC.RUMBLE_REPORT_LEN, len(report))
+check("rumble report id is 0x02", report[0] == 0x02, hex(report[0]))
+loud = CC.rumble_report(0xFFFF, 0xFFFF, 1)
+check("right actuator mirrors the left", loud[0x11:0x17] == loud[1:7],
+      (loud[1:7].hex(), loud[0x11:0x17].hex()))
+check("sequence lands in the low nibble", CC.rumble_report(0, 0, 5)[1] == 0x55,
+      hex(CC.rumble_report(0, 0, 5)[1]))
+check("amplitude is clamped below full scale",
+      CC.scale_amplitude(0xFFFF) == CC.RUMBLE_MAX_AMPLITUDE,
+      CC.scale_amplitude(0xFFFF))
+check("amplitude 0 stays 0", CC.scale_amplitude(0) == 0)
+
+got = []
+rsrv = DSUServer(port=0, on_rumble=lambda lo, hi: got.append((lo, hi)))
+rsrv.start()
+rcli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+rcli.settimeout(2.0)
+addr = ("127.0.0.1", rsrv.port)
+
+rcli.sendto(client_packet(D.MSG_MOTOR_INFO, b"\x00" * 8), addr)
+pkt, _ = rcli.recvfrom(1024)
+check("motor info: crc valid", crc_ok(pkt))
+check("motor info: replies with the right type",
+      struct.unpack_from("<I", pkt, 16)[0] == D.MSG_MOTOR_INFO)
+check("motor info: two motors reported", pkt[-1] == D.MOTOR_COUNT, pkt[-1])
+
+# 8-byte controller header, then motor id and intensity.
+rcli.sendto(client_packet(D.MSG_RUMBLE, b"\x00" * 8 + bytes([0, 255])), addr)
+time.sleep(0.2)
+check("rumble: motor 0 drives the low channel", got and got[-1][0] == 255 * 257, got)
+rcli.sendto(client_packet(D.MSG_RUMBLE, b"\x00" * 8 + bytes([1, 128])), addr)
+time.sleep(0.2)
+check("rumble: motor 1 drives the high channel", got and got[-1][1] == 128 * 257, got)
+
+before = len(got)
+rcli.sendto(client_packet(D.MSG_RUMBLE, b"\x00" * 8 + bytes([1, 128])), addr)
+time.sleep(0.2)
+check("rumble: repeating the same value is not re-emitted", len(got) == before, got)
+
+rcli.sendto(client_packet(D.MSG_RUMBLE, b"\x00" * 8 + bytes([9, 200])), addr)
+time.sleep(0.2)
+check("rumble: out-of-range motor id ignored", len(got) == before, got)
+
+# A client going silent must stop the motors rather than leave them running.
+D.RUMBLE_TIMEOUT = 0.5
+time.sleep(2.0)
+check("rumble: expires when the client goes quiet", got[-1] == (0, 0), got[-1])
+
+rsrv.stop()
+rcli.close()
+
+# Shutting down mid-effect has to silence the pad too.
+stopped = []
+ssrv = DSUServer(port=0, on_rumble=lambda lo, hi: stopped.append((lo, hi)))
+ssrv.start()
+scli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+scli.settimeout(2.0)
+scli.sendto(client_packet(D.MSG_RUMBLE, b"\x00" * 8 + bytes([0, 255])),
+            ("127.0.0.1", ssrv.port))
+time.sleep(0.2)
+ssrv.stop()
+check("rumble: stopping the server silences the motors",
+      stopped and stopped[-1] == (0, 0), stopped)
+scli.close()
+
+# With no callback the pad must report no motors rather than accept and drop.
+nsrv = DSUServer(port=0)
+nsrv.start()
+ncli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ncli.settimeout(2.0)
+ncli.sendto(client_packet(D.MSG_MOTOR_INFO, b"\x00" * 8), ("127.0.0.1", nsrv.port))
+pkt, _ = ncli.recvfrom(1024)
+check("no rumble support -> zero motors advertised", pkt[-1] == 0, pkt[-1])
+nsrv.stop()
+ncli.close()
+
 # stop
 srv.stop()
 check("stop: not running", not srv.running)

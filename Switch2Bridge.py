@@ -1213,6 +1213,7 @@ class Switch2BridgeApp(rumps.App):
         self.dsu = DSUServer(
             self.mappings.dsu_host, self.mappings.dsu_port,
             aliases=self.mappings.dsu_aliases,
+            on_rumble=self._on_dsu_rumble,
         )
         self.keyboard = KeyboardOutput(self.mappings)
         self.bridge = ControllerBridge(self.mappings, self.dsu, self.keyboard)
@@ -1556,6 +1557,18 @@ class Switch2BridgeApp(rumps.App):
         self._surface_mappings_messages()
         if ok:
             self._notify("Mappings reloaded", f"Loaded from {MAPPINGS_FILE.name}")
+
+    def _on_dsu_rumble(self, low, high):
+        """Pass a DSU client's rumble request through to the controller.
+
+        Wired only for now — rumble reaches the pad as a USB HID output report,
+        and the Bluetooth equivalent is not implemented. Over Bluetooth this
+        quietly does nothing, which is better than failing a request the client
+        is entitled to make.
+        """
+        usb = getattr(self.bridge, "usb", None)
+        if usb is not None:
+            usb.set_rumble(low, high)
 
     def _toggle_dsu(self, _):
         self.mappings.set_dsu_enabled(not self.mappings.dsu_enabled)

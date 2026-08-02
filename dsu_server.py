@@ -31,6 +31,17 @@ SERVER_ID = 0x53324252  # "S2BR"
 MSG_VERSION = 0x100000
 MSG_PORTS = 0x100001
 MSG_DATA = 0x100002
+# Rumble is an unofficial extension to the protocol rather than part of
+# rajkosto's original. Client support is thin — Cemu has an open feature
+# request for it — so this answers correctly and does nothing if nobody asks.
+MSG_MOTOR_INFO = 0x110001
+MSG_RUMBLE = 0x110002
+
+# The Pro 2 has a left and a right actuator, so DSU motor ids 0 and 1.
+MOTOR_COUNT = 2
+# Clients re-send rumble a few times a second. If one stops without sending a
+# zero the pad would buzz forever, so drop the effect after this long.
+RUMBLE_TIMEOUT = 5.0
 
 # Locally-administered, made-up MAC so clients can identify the pad
 PAD_MAC = b"\x02S2BRG"
@@ -75,11 +86,16 @@ def _axis_to_byte(value):
 class DSUServer:
     """Threaded UDP server. `push()` may be called from any thread."""
 
-    def __init__(self, host="127.0.0.1", port=26760, aliases=None):
+    def __init__(self, host="127.0.0.1", port=26760, aliases=None,
+                 on_rumble=None):
         self.host = host
         self.port = port
         # Switch 2-only buttons folded onto DSU slots, e.g. {"GL": "L"}
         self.aliases = dict(aliases or {})
+        # Called with two 0-65535 amplitudes when a client asks for rumble.
+        # None means the pad cannot rumble, which is reported honestly as a
+        # motor count of zero rather than accepting effects and dropping them.
+        self.on_rumble = on_rumble
         self.battery = BATTERY_NA
         self.last_error = None  # consumed by the UI tick
         self._sock = None
@@ -89,6 +105,8 @@ class DSUServer:
         self._clients = {}  # addr -> last request time
         self._counter = 0
         self._connected = False
+        self._motors = [0, 0]      # latest intensity per DSU motor id
+        self._rumble_seen = 0.0    # when a client last said anything about it
 
     # --- lifecycle ---
 
@@ -121,6 +139,12 @@ class DSUServer:
         return True
 
     def stop(self):
+        # Shutting the server down must not leave a running effect behind.
+        with self._lock:
+            buzzing = any(self._motors)
+            self._motors = [0, 0]
+        if buzzing:
+            self._emit_rumble(0, 0)
         self._stop.set()
         if self._thread:
             self._thread.join(2.0)
@@ -161,6 +185,46 @@ class DSUServer:
                 PAD_MAC, self.battery,
             )
         return struct.pack("<BBBB6sB", slot, 0, 0, 0, b"\x00" * 6, 0)
+
+    # --- rumble ---
+
+    def _set_motor(self, motor, intensity):
+        with self._lock:
+            # Refresh the deadline even when the value is unchanged: clients
+            # re-send the same intensity precisely to say "still going".
+            self._rumble_seen = time.monotonic()
+            if self._motors[motor] == intensity:
+                return
+            self._motors[motor] = intensity
+            low, high = self._motors
+        self._emit_rumble(low, high)
+
+    def _emit_rumble(self, low, high):
+        callback = self.on_rumble
+        if callback is None:
+            return
+        try:
+            # DSU motor 0 is the large/low-frequency actuator and 1 the small
+            # high-frequency one; 0-255 there, 16-bit amplitudes on the pad.
+            callback(low * 257, high * 257)
+        except Exception:
+            log.exception("DSU rumble callback failed")
+
+    def _expire_rumble(self):
+        """Stop the motors when the client driving them goes quiet.
+
+        A client that dies mid-effect never sends the zero, so without this the
+        controller would buzz until it was unplugged.
+        """
+        with self._lock:
+            if not any(self._motors):
+                return
+            if time.monotonic() - self._rumble_seen <= RUMBLE_TIMEOUT:
+                return
+            self._motors = [0, 0]
+        log.info("DSU: no rumble packets for %.0fs, stopping the motors",
+                 RUMBLE_TIMEOUT)
+        self._emit_rumble(0, 0)
 
     def _effective_buttons(self, state):
         """State buttons plus any aliased Switch 2-only buttons folded in."""
@@ -212,6 +276,9 @@ class DSUServer:
             try:
                 data, addr = self._sock.recvfrom(1024)
             except socket.timeout:
+                # A client that died mid-effect stops sending anything at all,
+                # so the silent path is exactly where expiry has to happen.
+                self._expire_rumble()
                 continue
             except OSError:
                 break  # socket closed
@@ -219,6 +286,8 @@ class DSUServer:
                 self._handle(data, addr)
             except Exception:
                 log.exception("DSU: failed to handle request from %s", addr)
+            finally:
+                self._expire_rumble()
         log.info("DSU server stopped")
 
     def _handle(self, data, addr):
@@ -245,6 +314,21 @@ class DSUServer:
             # Registration request: keep streaming to this client until timeout
             with self._lock:
                 self._clients[addr] = time.monotonic()
+
+        elif msg_type == MSG_MOTOR_INFO:
+            motors = MOTOR_COUNT if self.on_rumble else 0
+            reply = self._packet(
+                MSG_MOTOR_INFO, self._port_info(PAD_SLOT) + bytes([motors])
+            )
+            self._sock.sendto(reply, addr)
+
+        elif msg_type == MSG_RUMBLE:
+            # 8-byte controller header, then motor id and intensity.
+            if len(data) < 30 or not self.on_rumble:
+                return
+            motor, intensity = data[28], data[29]
+            if motor < MOTOR_COUNT:
+                self._set_motor(motor, intensity)
 
     # --- input feed (called from the BLE thread) ---
 

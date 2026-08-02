@@ -405,13 +405,61 @@ returned. `08/02` is documented as enabling the grip buttons on the *charging
 grip*, so a Pro 2 refusing it is unsurprising. Dropping both makes no difference
 to input, motion or the report rate.
 
+## Rumble goes to the HID interface — the exact opposite of commands
+
+This one is worth stating plainly because the two halves of the USB protocol
+have **opposite** rules, and each one's failure mode looks like success:
+
+| | correct path | what the wrong path does |
+|---|---|---|
+| Init commands | vendor interface 1, bulk `0x02` | HID output report returns a byte count and does nothing |
+| Rumble | HID output report `0x02` on interface 0 | command `0x0A/0x08` on interface 1 **replies `0a 01 00 08 00 f8 00 00`** and does nothing |
+
+The rumble ACK is the nastier of the two. `0x0A/0x08` is a real command that the
+firmware acknowledges with the documented success byte, so every signal says it
+worked. It was only ruled out by running both paths back to back with different
+patterns — three short pulses against one long buzz — and having a person say
+which they actually felt. No amount of reading return codes would have caught
+it.
+
+### Report layout
+
+HID output report `0x02`, 64 bytes:
+
+```
+[0]        report id 0x02
+[1]        0x50 | (sequence & 0x0F)
+[2:7]      HD rumble frame, five bytes
+[0x11:17]  right actuator: a byte-for-byte copy of [1:7], sequence included
+```
+
+A frame packs two frequency/amplitude pairs, 12-bit frequencies and 10-bit
+amplitudes straddling byte boundaries:
+
+```
+byte 0   high_freq & 0xFF
+byte 1   ((high_amp >> 4) & 0xFC) | ((high_freq >> 8) & 0x03)
+byte 2   (high_amp >> 12) | (low_freq << 4)
+byte 3   (low_amp & 0xC0) | ((low_freq >> 4) & 0x3F)
+byte 4   low_amp >> 8
+```
+
+Carrier frequencies of `0x187` high and `0x112` low are what SDL settled on and
+work here. **The motors decay unless the report is repeated** roughly every
+12 ms, so an effect is a stream rather than a one-shot, and stopping means
+sending an explicit zero frame rather than simply going quiet.
+
+Amplitude is clamped to 29000 of a possible 65535. That is SDL's number, and
+its reasoning is worth keeping: the actuators are strong enough that it calls
+the controller "a game controller, not a massage device".
+
 ## Still unsolved
 
 * **Exiting pairing mode** — the controller keeps advertising, so a nearby
   console reconnects to it. Wired sidesteps it entirely
-* **Rumble** — not attempted here, though the encoding is now documented:
-  five-byte HD frames of 10-bit frequency/amplitude pairs, three frames per
-  16-byte block, left at offset 1 and right at 17 of output report `0x02`
+* **Rumble over Bluetooth** — the wired path above is verified; the BLE
+  equivalent writes the same frames to a vibration characteristic and is not
+  implemented here yet
 * **Motion over Bluetooth** — report `0x05` is verified over USB here. ndeadly's
   captures name handle `0x000A` for it, against `0x000E` for `0x09`, so the BLE
   path likely needs a different characteristic as well as the format command

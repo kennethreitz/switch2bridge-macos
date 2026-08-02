@@ -203,6 +203,59 @@ Replaying this verbatim did **not** make `...f8` or `...fd2` start streaming
 for us, and did not enable motion. `tools/replay_console_init.py` reproduces
 the experiment.
 
+## There is no USB compatibility mode, and the wired command space is small
+
+The Pro 2 does **not** have a mode that makes it enumerate as a Switch 1 Pro
+Controller (`057e:2009`). If you see `057e:2009` alongside a Pro 2, it is either
+a genuine Switch 1 pad or Steam's own virtual gamepad — Steam creates one via
+`IOHIDUserDevice` and records it in
+`~/Library/Application Support/Steam/config/virtualgamepadinfo.txt` as
+`name=Nintendo Switch Pro Controller, VID=0x057e, PID=0x2009, type=switchpro`.
+It will sit on the same USB `LocationID` if it replaced the Pro 2 in the same
+port, which makes it easy to mistake for a mode change.
+
+Evidence:
+
+* one USB configuration only (`bNumConfigurations = 1`), `bcdDevice = 0x0201`,
+  so there is no alternate config to select
+* sweeping command ids `0x01`–`0x1F` on interface 1 never changed the pid
+
+### Command sweep results
+
+Sent as `03 91 00 <cmd> 00 00 00 00` — report type `0x03`, **zero-length
+payload** — to interface 1 endpoint `0x02`, reading `0x82`, re-checking the pid
+after every command. Empty payloads were deliberate: an SPI write needs an
+address and data, so a malformed empty frame should be rejected rather than
+executed.
+
+| Command | Behaviour |
+|---|---|
+| `0x01` | **Device reset.** Drops off the bus and re-enumerates, same pid. Note the console sends `0x01` as report type `0x11`, not `0x03` |
+| `0x08`, `0x09` | Reply `03 01 00 <cmd> 00 f8 00 00` — accepted |
+| `0x0F` | Reply `03 01 00 0f 00 f8 00 00 05 00` — accepted, returns a 2-byte payload `05 00` |
+| `0x03`, `0x05`, `0x06`, `0x0B`, `0x0C`, `0x0E` | No reply at all |
+| `0x10`–`0x1F` | Uniform `03 04 00 <cmd> 00 f8 00 00` — almost certainly "unknown command" |
+
+### Reply framing
+
+Replies mirror the command header, with two fields repurposed:
+
+```
+byte 0   report type, echoed
+byte 1   0x01 on a real reply  (= MODE_REPLY in controller_commands)
+         0x04 on the 0x10-0x1F block, i.e. a different class — likely unknown-command
+byte 3   command id, echoed
+byte 5   result byte
+```
+
+Worth noting against the BLE observation above: **over USB this unit replies
+`0xF8`**, the documented ACK, not the `0x78` it gives over BLE. So the `0x78`
+is a BLE-transport quirk rather than a property of the unit.
+
+Unexplored: `0x08`, `0x09` and `0x0F` are accepted but their payload formats are
+unknown, and only report type `0x03` was swept — `0x02`, `0x0A`, `0x0C` and
+`0x11` may expose different commands at the same ids.
+
 ## Still unsolved
 
 * **Motion / gyro** — the extended report payload does not decode as motion.

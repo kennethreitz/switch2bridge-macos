@@ -491,10 +491,70 @@ still the magnitude barely moves, while the false hit varied by 7473 counts,
 nearly 2 g. Requiring a near-constant magnitude, and running the test at rest,
 separates a sensor from noise. Magnitude alone does not.
 
-So motion is USB-only as far as anything here can drive it. Worth noting what
-this does *not* prove: the console does get motion over BLE, and it is a
-*paired* host, which these characteristics may well be gated behind. That makes
-pairing (command `0x15`) the most promising lead rather than a dead end.
+So motion is USB-only as far as anything here can drive it.
+
+The obvious next suspect was pairing: the console gets motion over BLE and is a
+*paired* host, so those characteristics might be gated behind it. **They are
+not.** Pairing was implemented, committed to the controller's flash and
+verified there, and the test above was then re-run — `...fd2` and `...f8` stay
+silent, `...f9` keeps its 112-byte report, and there is still no accelerometer
+anywhere. Being a stored host is not what unlocks motion.
+
+What is still untested is link *encryption*. CoreBluetooth does its own pairing
+and offers no way to hand it the LTK the controller now stores, so the
+connection is probably not authenticated in the way a console's is, even though
+our address is in the flash. That is the remaining difference, and not one an
+app can close from macOS.
+
+## Pairing: command `0x15`, and what it is worth
+
+The controller does not use Bluetooth SMP. Nintendo run their own exchange over
+the command channel, and it works over USB exactly as it does over BLE — the
+host address travels in the payload, so the link used to conduct it does not
+decide what gets stored. That is how a console pairs a controller over a cable.
+
+```
+0x15/0x01   exchange addresses   [0x00, count, addr_reversed * count]
+0x15/0x04   exchange keys        [0x00, A1_reversed]  -> [0x01, B1_reversed]
+0x15/0x02   confirm LTK          [0x00, A2_reversed]  -> [0x01, B2_reversed]
+0x15/0x03   finalise             [0x00]  — commits to flash 0x001FA000
+```
+
+`LTK = A1 xor reverse(B1)`, and the controller proves it derived the same key
+by answering the challenge with `AES128-ECB(LTK, A2)`. The console always sends
+two addresses, the second being the first with its low byte decremented, and
+both entries share one key.
+
+Because step three is a cryptographic check, a run that stops before step four
+verifies the entire exchange **without writing anything** — a real dry run
+rather than a partial rehearsal.
+
+After committing, the block reads back as:
+
+```
+0213100000000000 c0c7db11c43f0000     primary host address at offset 8
+0000000000000000 0000832fc66845d0
+0abb746569325bbf a2a0000000000000     LTK at offset 26
+c0c7db11c43e0000 0000000000000000     secondary address at offset 48
+```
+
+Addresses are stored in **natural** order; the LTK is stored **reversed**, i.e.
+in wire order. Both stored entries are the pairing host's own pair, so
+committing displaces whatever was there — expect to re-pair the controller with
+a console afterwards.
+
+### `B1` is a constant, so this is not a key agreement
+
+Across separate runs the controller returns the same `B1` every time:
+
+```
+5cf6ee792cdf05e1ba2b6325c41a5f10
+```
+
+which is also the value ndeadly documented. Our `A1` is fresh random each run,
+so the LTK differs each time — but it is determined entirely by the host, since
+the controller's contribution is fixed. Anyone who can see `A1` on the wire
+knows the resulting key. Worth knowing before treating the LTK as a secret.
 
 ## Still unsolved
 

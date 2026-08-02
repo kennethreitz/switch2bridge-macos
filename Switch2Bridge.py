@@ -13,6 +13,7 @@ License: MIT
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import struct
@@ -72,7 +73,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.8.0"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.8.1"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -563,9 +564,13 @@ class ControllerBridge:
     # Scan window used while watching. Short, so a controller entering
     # pairing mode is picked up quickly and USB is noticed promptly too.
     WATCH_SCAN_TIMEOUT = 3.0
-    # How often to look for a cable while streaming over Bluetooth. Plugging
-    # in should upgrade to wired without making the user reconnect.
+    # How often to look for a cable. Plugging in should upgrade to wired
+    # without making the user reconnect, whatever the radio is doing.
     USB_POLL_INTERVAL = 1.0
+    # How long to leave a cable alone after failing to claim it. Without this,
+    # a cable that enumerates but will not open has the loop abandon Bluetooth
+    # and retry it every second for as long as it stays plugged in.
+    USB_RETRY_COOLDOWN = 10.0
     # Upper bound on the whole configure step, so a controller that never
     # answers costs us a moment rather than the connection
     CONFIG_TIMEOUT = 3.0
@@ -584,7 +589,7 @@ class ControllerBridge:
             auto_center=mappings.stick_auto_center,
         )
         self.watching = False      # keep looking instead of giving up
-        self._upgrade_to_usb = False  # cable appeared mid Bluetooth session
+        self._usb_retry_after = 0.0   # cable we failed to claim: leave it be
         self.usb = None            # USBTransport while wired
         self.transport = None      # "usb" or "ble" once connected
         self.is_connected = False
@@ -813,6 +818,56 @@ class ControllerBridge:
         )
         return None, None
 
+    # --- cable watching ---
+
+    # Returned by _until_cable when the cable, not the Bluetooth work, won.
+    _CABLE = object()
+
+    async def _cable_appeared(self):
+        """Resolve once a usable cable is plugged in."""
+        while not self._stop_event.is_set():
+            if (
+                self.mappings.usb_enabled
+                and time.monotonic() >= self._usb_retry_after
+                and usb_transport.is_connected()
+            ):
+                return
+            await asyncio.sleep(self.USB_POLL_INTERVAL)
+
+    async def _until_cable(self, coro):
+        """Run `coro`, abandoning it if a cable turns up first.
+
+        Every Bluetooth step blocks for seconds at a time — a scan runs its
+        timeout out in full, a connect can sit for CONNECT_TIMEOUT — and the
+        cable used to be looked at only between steps, so plugging in during
+        a scan or a handshake did nothing for up to twenty seconds. Racing
+        the two means a cable is noticed within USB_POLL_INTERVAL no matter
+        which stage the radio is in.
+
+        Returns whatever `coro` returned, or `_CABLE` if the cable won.
+        """
+        work = asyncio.ensure_future(coro)
+        cable = asyncio.ensure_future(self._cable_appeared())
+        try:
+            await asyncio.wait({work, cable}, return_when=asyncio.FIRST_COMPLETED)
+            if work.done():
+                return work.result()
+            return self._CABLE
+        finally:
+            cable.cancel()
+            if not work.done():
+                work.cancel()
+                # Awaited rather than dropped: a cancelled session still has to
+                # run its own cleanup, which tears down the CoreBluetooth link.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await work
+
+    def _note_cable_upgrade(self):
+        """Report the switch to wired as an upgrade rather than a failure."""
+        log.info("cable plugged in — upgrading to wired")
+        self.last_error = None
+        self.last_notice = "Cable connected — switching to wired"
+
     # --- main async routine ---
 
     async def _session(self, address, name, reconnected=False):
@@ -862,18 +917,10 @@ class ControllerBridge:
             # connection nor slows down noticing a drop.
             config_task = asyncio.create_task(self._configure_with_timeout(client))
             try:
-                next_usb_poll = time.monotonic() + self.USB_POLL_INTERVAL
+                # A cable arriving here is handled by the caller's race, which
+                # cancels this session — wired is 250 Hz against 33 Hz.
                 while not self._stop_event.is_set() and client.is_connected:
                     await asyncio.sleep(0.1)
-                    now = time.monotonic()
-                    if now < next_usb_poll:
-                        continue
-                    next_usb_poll = now + self.USB_POLL_INTERVAL
-                    if self.mappings.usb_enabled and usb_transport.is_connected():
-                        # Wired is 250 Hz against 33 Hz here; take it.
-                        log.info("cable plugged in — upgrading to wired")
-                        self._upgrade_to_usb = True
-                        break
             finally:
                 config_task.cancel()
             return True
@@ -919,6 +966,9 @@ class ControllerBridge:
         """
         if not self.mappings.usb_enabled or not usb_transport.is_connected():
             return False
+        if time.monotonic() < self._usb_retry_after:
+            # Still backing off a cable that would not open; stay on Bluetooth.
+            return False
 
         def on_report(body):
             self._on_data(None, body)
@@ -928,10 +978,15 @@ class ControllerBridge:
 
         transport = usb_transport.USBTransport(on_report, on_error)
         if not transport.connect():
+            # Back off before looking at this cable again, or the loop spends
+            # every second abandoning Bluetooth to retry a cable that will not
+            # open — which is worse than simply staying on the radio.
+            self._usb_retry_after = time.monotonic() + self.USB_RETRY_COOLDOWN
             if transport.last_error:
                 log.info("wired connect failed: %s", transport.last_error)
                 self.last_notice = "USB found but unavailable — using Bluetooth"
             return False
+        self._usb_retry_after = 0.0
 
         self.calibration.reset()
         if self.mappings.use_factory_calibration:
@@ -982,8 +1037,10 @@ class ControllerBridge:
                     self.last_notice = "USB disconnected — searching Bluetooth"
                     continue
                 try:
-                    address, name = await self._find_controller(
-                        self.WATCH_SCAN_TIMEOUT if self.watching else SCAN_TIMEOUT
+                    found = await self._until_cable(
+                        self._find_controller(
+                            self.WATCH_SCAN_TIMEOUT if self.watching else SCAN_TIMEOUT
+                        )
                     )
                 except Exception as e:
                     log.exception("BLE scan failed")
@@ -998,12 +1055,23 @@ class ControllerBridge:
                 if self._stop_event.is_set():
                     return
 
+                if found is self._CABLE:
+                    self._note_cable_upgrade()
+                    continue
+                address, name = found
+
                 streamed = False
                 if address:
                     self.is_searching = False
-                    streamed = await self._session(
-                        address, name, reconnected=was_connected
+                    outcome = await self._until_cable(
+                        self._session(address, name, reconnected=was_connected)
                     )
+                    if self._stop_event.is_set():
+                        return
+                    if outcome is self._CABLE:
+                        self._note_cable_upgrade()
+                        continue
+                    streamed = outcome
                     if not streamed and was_connected:
                         # Still auto-retrying — keep the failure in the logs
                         # only; a notification per attempt would spam the user.
@@ -1011,14 +1079,6 @@ class ControllerBridge:
 
                 if self._stop_event.is_set():
                     return
-
-                if self._upgrade_to_usb:
-                    # Not a failure: drop the radio link and let the top of
-                    # the loop pick the cable up.
-                    self._upgrade_to_usb = False
-                    self.last_error = None
-                    self.last_notice = "Cable connected — switching to wired"
-                    continue
 
                 if streamed and self.watching:
                     self.is_reconnecting = False

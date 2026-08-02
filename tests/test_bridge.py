@@ -562,8 +562,46 @@ check("cable ignored when usb is off",
       br_stay.is_connected and br_stay.transport == "ble", br_stay.transport)
 br_stay.disconnect(wait=True, timeout=3.0)
 
+# ============ cable arriving mid-scan ============
+# The regression this guards: the cable used to be looked at only between
+# Bluetooth steps, so plugging in while a scan or handshake was in flight did
+# nothing until that step ran itself out — up to ~20 s of a dead cable.
+print("== usb during a bluetooth scan ==")
+_ut.USBTransport = FakeUSB
+MockScanner.queue = []
+MockScanner.result = {}          # nothing to find; the scan just runs long
+MockScanner.delay = 8.0          # stands in for a slow scan or handshake
+_ut.is_connected = lambda: False
+
+br_scan = S2B.ControllerBridge(mm_hot)
+br_scan.connect(watch=True)
+time.sleep(1.0)                  # let it get well inside the scan
+check("scanning, not yet wired", br_scan.transport != "usb", br_scan.transport)
+_ut.is_connected = lambda: True  # cable goes in mid-scan
+time.sleep(3.0)                  # far short of the 8 s the scan would take
+check("cable seen without waiting for the scan to finish",
+      br_scan.transport == "usb", br_scan.transport)
+check("wired session is live", br_scan.is_connected)
+br_scan.disconnect(wait=True, timeout=3.0)
+
+# an unclaimable cable must not make the loop abandon Bluetooth every second
+print("== unclaimable cable does not spin ==")
+_ut.USBTransport = DeadUSB
+MockScanner.delay = 0.3
+br_spin = S2B.ControllerBridge(mm_hot)
+br_spin.connect(watch=True)
+time.sleep(1.0)
+attempts_start = br_spin._usb_retry_after
+time.sleep(2.0)
+check("backing off a cable it cannot claim",
+      br_spin._usb_retry_after == attempts_start
+      and br_spin._usb_retry_after > time.monotonic(),
+      br_spin._usb_retry_after)
+br_spin.disconnect(wait=True, timeout=3.0)
+
 _ut.is_connected = _orig_is_conn
 _ut.USBTransport = _orig_transport
+MockScanner.delay = 0.3
 
 print()
 if FAILURES:

@@ -453,6 +453,49 @@ Amplitude is clamped to 29000 of a possible 65535. That is SDL's number, and
 its reasoning is worth keeping: the actuators are strong enough that it calls
 the controller "a game controller, not a massage device".
 
+## Report `0x05` does not come up over Bluetooth
+
+Motion works over USB, so the obvious question is whether the same command
+works over the radio. It does not — the command is accepted and nothing
+changes. `tools/ble_motion.py` reproduces this.
+
+Over BLE all three commands are acknowledged, with the `0x78` result byte this
+transport gives:
+
+```
+0c 91 01 02 ... feature mask      -> 0c 01 01 02 10 78 00 00   accepted
+0c 91 01 04 ... enable features   -> 0c 01 01 04 10 78 00 00   accepted
+03 91 01 0a ... select report 05  -> 03 01 01 0a 10 78 00 00   accepted
+```
+
+And yet:
+
+* `...f9`, the characteristic this project reads, keeps sending the same
+  112-byte extended report at 33 Hz. It does not switch to the 64-byte
+  report `0x05` layout
+* **`...fd2` and `...f8` stay completely silent** — zero packets across the
+  whole session. Note bleak prints *declaration* handles, so those two are
+  value handles `0x000A` and `0x000E`, exactly the pair ndeadly's motion
+  captures are named after. The console reads motion from characteristics
+  that never send us anything
+* With the controller stationary, no offset anywhere in the packet holds an
+  int16 triple with a steady 1 g magnitude
+
+That last check is worth describing, because the first version of it was
+wrong. Searching for "three int16s whose magnitude is about 1 g" finds the
+accelerometer regardless of layout, which avoids assuming USB's offsets. But
+run against the high-entropy tail it confidently reported an accelerometer at
+offset 83 — random data lands near any given magnitude often enough. What kills
+the false positive is that **gravity is **steady**: on a controller sitting
+still the magnitude barely moves, while the false hit varied by 7473 counts,
+nearly 2 g. Requiring a near-constant magnitude, and running the test at rest,
+separates a sensor from noise. Magnitude alone does not.
+
+So motion is USB-only as far as anything here can drive it. Worth noting what
+this does *not* prove: the console does get motion over BLE, and it is a
+*paired* host, which these characteristics may well be gated behind. That makes
+pairing (command `0x15`) the most promising lead rather than a dead end.
+
 ## Still unsolved
 
 * **Exiting pairing mode** — the controller keeps advertising, so a nearby
@@ -460,9 +503,8 @@ the controller "a game controller, not a massage device".
 * **Rumble over Bluetooth** — the wired path above is verified; the BLE
   equivalent writes the same frames to a vibration characteristic and is not
   implemented here yet
-* **Motion over Bluetooth** — report `0x05` is verified over USB here. ndeadly's
-  captures name handle `0x000A` for it, against `0x000E` for `0x09`, so the BLE
-  path likely needs a different characteristic as well as the format command
+* **Motion over Bluetooth** — see below; selecting report `0x05` is accepted
+  but changes nothing, so on this firmware motion is USB-only so far
 
 ---
 

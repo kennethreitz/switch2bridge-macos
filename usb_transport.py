@@ -26,6 +26,7 @@ protocol reference only.
 """
 
 import controller_commands as cc
+import controller_pairing as cp
 import logging
 import sys
 import threading
@@ -274,6 +275,36 @@ class USBTransport:
         self.connected = True
         log.info("USB transport connected")
         return True
+
+    # --- pairing ---
+
+    def run_pairing(self, host_address, commit=False):
+        """Pair the controller with `host_address` over the channel we hold.
+
+        Reusing this transport's own claim is the point: the standalone tool
+        needs the app closed precisely because two processes cannot claim the
+        same interface, and from in here there is nothing to close.
+
+        With `commit` false nothing is written — see controller_pairing.pair.
+        """
+        if self._device is None:
+            raise RuntimeError("the controller is not connected over USB")
+
+        def send(frame):
+            self._device.write(ENDPOINT_OUT, frame, 1000)
+            # Replies to other traffic can sit ahead of ours in the pipe, so
+            # read until a pairing reply appears rather than taking the first.
+            for _attempt in range(6):
+                try:
+                    reply = bytes(self._device.read(ENDPOINT_IN, 96, 1000))
+                except Exception:
+                    return b""
+                if reply and reply[0] == cp.CMD_PAIRING:
+                    return reply
+            return b""
+
+        return cp.pair(send, host_address, transport=cp.TRANSPORT_USB,
+                       commit=commit)
 
     # --- rumble ---
 

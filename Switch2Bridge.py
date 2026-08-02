@@ -57,6 +57,7 @@ from controller_state import (
     shape_stick,
 )
 import controller_commands as cc
+import controller_pairing
 from dsu_server import ALIASABLE_BUTTONS, DSUServer
 from outputs import SPECIAL_KEY_NAMES, KeyboardOutput, pynput_available
 import usb_transport
@@ -73,7 +74,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.8.1"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.9.0"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -1232,6 +1233,10 @@ class Switch2BridgeApp(rumps.App):
         self._recal_item = rumps.MenuItem(
             "Recalibrate sticks", callback=self._recalibrate
         )
+        self._rumble_item = rumps.MenuItem("Test rumble", callback=self._test_rumble)
+        self._pair_item = rumps.MenuItem(
+            "Pair with this Mac…", callback=self._pair_controller
+        )
         self._capture_item = rumps.MenuItem(
             "Capture raw packets", callback=self._toggle_raw_capture
         )
@@ -1253,6 +1258,8 @@ class Switch2BridgeApp(rumps.App):
             self._dsu_item,
             self._keyboard_item,
             self._recal_item,
+            self._rumble_item,
+            self._pair_item,
             None,
             self._capture_item,
             self._login_item,
@@ -1616,6 +1623,89 @@ class Switch2BridgeApp(rumps.App):
         self.bridge.calibration.reset()
         self._notify(
             "Sticks", "Let go of both sticks — the centre is being re-measured."
+        )
+
+    def _wired_transport(self, feature):
+        """The USB transport, or None with the reason shown to the user.
+
+        Both rumble and pairing are wired-only, and "nothing happened" is a
+        poor way to learn that.
+        """
+        usb = getattr(self.bridge, "usb", None)
+        if usb is not None and usb.connected:
+            return usb
+        self._notify(
+            feature,
+            "Connect the controller with a USB cable — this is not supported "
+            "over Bluetooth yet.",
+        )
+        return None
+
+    def _test_rumble(self, _):
+        usb = self._wired_transport("Rumble")
+        if usb is None:
+            return
+
+        def demo():
+            # Off the UI thread: this holds for over a second, and a menubar
+            # app that freezes while buzzing would look like a crash.
+            try:
+                for amplitude in (18000, 40000, 0xFFFF):
+                    usb.set_rumble(amplitude, amplitude)
+                    time.sleep(0.3)
+                usb.set_rumble(0, 0)
+            except Exception:
+                log.exception("rumble test failed")
+
+        threading.Thread(target=demo, name="rumble-test", daemon=True).start()
+
+    def _pair_controller(self, _):
+        usb = self._wired_transport("Pairing")
+        if usb is None:
+            return
+        host = controller_pairing.local_bluetooth_address()
+        if host is None:
+            self._notify("Pairing", "Could not read this Mac's Bluetooth address.")
+            return
+
+        # Verify before asking. Step three of the exchange is a cryptographic
+        # check, so a clean dry run proves the whole thing works while leaving
+        # the controller untouched — no reason to put the warning in front of
+        # someone if it was going to fail anyway.
+        try:
+            usb.run_pairing(host, commit=False)
+        except Exception as e:
+            log.exception("pairing dry run failed")
+            self._notify("Pairing failed", str(e))
+            return
+
+        confirmed = rumps.alert(
+            title="Pair this controller with your Mac?",
+            message=(
+                "The controller will remember this Mac "
+                f"({controller_pairing.format_address(host)}) and reconnect to "
+                "it instead of advertising for any console to claim.\n\n"
+                "It only keeps one host's pairing, so your Switch 2 will most "
+                "likely stop reconnecting to this controller until you pair it "
+                "there again.\n\n"
+                "The exchange has already been verified without writing "
+                "anything. Continuing is what writes it."
+            ),
+            ok="Pair",
+            cancel="Cancel",
+        )
+        if confirmed != 1:
+            return
+
+        try:
+            usb.run_pairing(host, commit=True)
+        except Exception as e:
+            log.exception("pairing failed")
+            self._notify("Pairing failed", str(e))
+            return
+        self._notify(
+            "Paired",
+            f"The controller now knows this Mac ({controller_pairing.format_address(host)}).",
         )
 
     def _toggle_raw_capture(self, _):

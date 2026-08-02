@@ -45,7 +45,12 @@ OPTIONS = {
     # resolves it through a hardcoded /opt/homebrew path.
     'frameworks': [LIBUSB] if os.path.exists(LIBUSB) else [],
     'includes': ['Foundation', 'AppKit', 'CoreBluetooth', 'ApplicationServices',
-                 'ServiceManagement', 'dsu_server', 'controller_state', 'controller_commands', 'outputs', 'usb_transport'],
+                 'ServiceManagement', 'dsu_server', 'controller_state',
+                 'controller_commands', 'controller_pairing', 'outputs',
+                 'usb_transport',
+                 # Pairing reads the local Bluetooth address through
+                 # IOBluetooth, which CoreBluetooth does not expose.
+                 'IOBluetooth'],
 }
 
 setup(

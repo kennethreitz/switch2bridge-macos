@@ -376,9 +376,14 @@ Which also explains the address discrepancy in the first section: SDL reads a
 `0x40`-byte block at `0x13080` / `0x130C0` and takes the 9-byte record from
 offset `0x28`, landing on exactly the `0x130A8` / `0x130E8` documented above.
 
-User calibration lives at `0x001FC040` and `0x001FC080` — note `0x80`, not the
-`0x60` guessed here earlier — and is only valid when the block starts `B2 A1`,
-with the record at offset 2. Both were erased on this unit.
+User calibration is only valid when the block starts `B2 A1`, with the record
+at offset 2. The primary block is `0x001FC040`; **the secondary address is
+unresolved**. SDL reads `0x001FC080`, ndeadly's `memory_layout.md` says
+`0x001FC060`. Both blocks were erased on this unit, so there was nothing to
+check either against, and an earlier version of these notes wrote SDL's number
+down as settled — it is not. ndeadly's comes from decrypted captures, which is
+better evidence than an inference over an erased block, so treat `0x60` as at
+least as likely until someone has a unit with user calibration stored.
 
 ## The full USB init, and two commands this unit rejects
 

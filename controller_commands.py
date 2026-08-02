@@ -124,6 +124,26 @@ def encode_hd_rumble(high_amplitude, low_amplitude,
     ])
 
 
+# Bluetooth carries rumble on its own characteristic rather than through the
+# command channel. Write-without-response, so nothing acknowledges a bad frame.
+VIBRATION_CHAR = "cc483f51-9258-427d-a939-630c31f72b05"
+
+
+def ble_rumble_payload(low_amplitude, high_amplitude, sequence):
+    """Bluetooth vibration write: 0x00, then one 16-byte block per actuator.
+
+    The block is the same shape as the wired report — a sequence byte followed
+    by a single HD frame. Tested against the alternatives on hardware: three
+    repeated frames per block also works, but dropping the sequence byte does
+    nothing at all, so it is required rather than padding.
+    """
+    block = bytearray(16)
+    block[0] = 0x50 | (sequence & 0x0F)
+    block[1:6] = encode_hd_rumble(scale_amplitude(high_amplitude),
+                                  scale_amplitude(low_amplitude))
+    return bytes([0x00]) + bytes(block) + bytes(block)
+
+
 def rumble_report(low_amplitude, high_amplitude, sequence):
     """USB HID output report 0x02 driving both actuators.
 

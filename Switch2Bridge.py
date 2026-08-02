@@ -74,7 +74,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.9.0"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.9.1"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -575,6 +575,9 @@ class ControllerBridge:
     # Upper bound on the whole configure step, so a controller that never
     # answers costs us a moment rather than the connection
     CONFIG_TIMEOUT = 3.0
+    # Zero frames sent after an effect ends. One dropped stop frame would
+    # otherwise leave the motors running.
+    RUMBLE_TRAILING_FRAMES = 3
     # How many raw reports "Capture raw packets" writes to the log
     RAW_CAPTURE_LIMIT = 300
 
@@ -591,6 +594,11 @@ class ControllerBridge:
         )
         self.watching = False      # keep looking instead of giving up
         self._usb_retry_after = 0.0   # cable we failed to claim: leave it be
+        # Rumble state, shared with whichever transport is live. Wired owns its
+        # own repeat loop; Bluetooth is driven from the session's event loop.
+        self._rumble_state = (0, 0)
+        self._rumble_lock = threading.Lock()
+        self._rumble_seq = 0
         self.usb = None            # USBTransport while wired
         self.transport = None      # "usb" or "ble" once connected
         self.is_connected = False
@@ -819,6 +827,59 @@ class ControllerBridge:
         )
         return None, None
 
+    # --- rumble ---
+
+    def set_rumble(self, low_amplitude, high_amplitude):
+        """Drive the motors over whichever transport is connected.
+
+        Returns False when there is nothing to drive, so callers can say so
+        rather than leaving a click looking like it did nothing.
+        """
+        pair = (max(0, min(0xFFFF, int(low_amplitude))),
+                max(0, min(0xFFFF, int(high_amplitude))))
+        if self.usb is not None and self.usb.connected:
+            self.usb.set_rumble(*pair)
+            return True
+        if self.is_connected and self.transport == "ble":
+            with self._rumble_lock:
+                self._rumble_state = pair
+            return True
+        return False
+
+    async def _ble_rumble_loop(self, client):
+        """Repeat the current effect over Bluetooth until it is cleared.
+
+        The motors decay unless refreshed, exactly as they do wired. The
+        cadence is slower here on purpose: the connection interval is 30 ms, so
+        writing faster than that only queues frames the radio cannot carry.
+        """
+        trailing = 0
+        while True:
+            with self._rumble_lock:
+                low, high = self._rumble_state
+            if low or high:
+                trailing = self.RUMBLE_TRAILING_FRAMES
+            elif trailing > 0:
+                trailing -= 1     # explicit zero frames, then go quiet
+            else:
+                await asyncio.sleep(0.05)
+                continue
+            self._rumble_seq += 1
+            try:
+                await client.write_gatt_char(
+                    cc.VIBRATION_CHAR,
+                    cc.ble_rumble_payload(low, high, self._rumble_seq),
+                    response=False,
+                )
+            except Exception:
+                log.debug("BLE rumble write failed", exc_info=True)
+                return
+            await asyncio.sleep(0.03)
+
+    def _clear_rumble(self):
+        with self._rumble_lock:
+            self._rumble_state = (0, 0)
+
     # --- cable watching ---
 
     # Returned by _until_cable when the cable, not the Bluetooth work, won.
@@ -917,6 +978,10 @@ class ControllerBridge:
             # alongside the stream so a silent controller neither delays the
             # connection nor slows down noticing a drop.
             config_task = asyncio.create_task(self._configure_with_timeout(client))
+            # Rumble needs a writer on this loop for as long as the session
+            # lasts; the wired transport drives its own from a thread.
+            self._clear_rumble()
+            rumble_task = asyncio.create_task(self._ble_rumble_loop(client))
             try:
                 # A cable arriving here is handled by the caller's race, which
                 # cancels this session — wired is 250 Hz against 33 Hz.
@@ -924,6 +989,17 @@ class ControllerBridge:
                     await asyncio.sleep(0.1)
             finally:
                 config_task.cancel()
+                # Stop the motors before the link goes, or an effect running at
+                # disconnect has nothing left to turn it off.
+                self._clear_rumble()
+                if client.is_connected:
+                    with contextlib.suppress(Exception):
+                        await client.write_gatt_char(
+                            cc.VIBRATION_CHAR,
+                            cc.ble_rumble_payload(0, 0, self._rumble_seq + 1),
+                            response=False,
+                        )
+                rumble_task.cancel()
             return True
         finally:
             self.is_connecting = False
@@ -1568,14 +1644,10 @@ class Switch2BridgeApp(rumps.App):
     def _on_dsu_rumble(self, low, high):
         """Pass a DSU client's rumble request through to the controller.
 
-        Wired only for now — rumble reaches the pad as a USB HID output report,
-        and the Bluetooth equivalent is not implemented. Over Bluetooth this
-        quietly does nothing, which is better than failing a request the client
-        is entitled to make.
+        Works on either transport. With nothing connected this does nothing,
+        which is better than failing a request the client is entitled to make.
         """
-        usb = getattr(self.bridge, "usb", None)
-        if usb is not None:
-            usb.set_rumble(low, high)
+        self.bridge.set_rumble(low, high)
 
     def _toggle_dsu(self, _):
         self.mappings.set_dsu_enabled(not self.mappings.dsu_enabled)
@@ -1625,25 +1697,31 @@ class Switch2BridgeApp(rumps.App):
             "Sticks", "Let go of both sticks — the centre is being re-measured."
         )
 
-    def _wired_transport(self, feature):
-        """The USB transport, or None with the reason shown to the user.
+    def _tell(self, subtitle, message):
+        """Say something in answer to a click, where it cannot be missed.
 
-        Both rumble and pairing are wired-only, and "nothing happened" is a
-        poor way to learn that.
+        Notifications are the wrong tool for this: macOS drops them silently
+        if the app has no notification permission or Focus is on, and the
+        result is a menu item that appears to do nothing at all. Anything the
+        user explicitly asked for gets a dialog.
         """
+        rumps.alert(title=APP_NAME, message=f"{subtitle}\n\n{message}", ok="OK")
+
+    def _wired_transport(self, feature):
+        """The USB transport, or None having explained why there isn't one."""
         usb = getattr(self.bridge, "usb", None)
         if usb is not None and usb.connected:
             return usb
-        self._notify(
+        self._tell(
             feature,
-            "Connect the controller with a USB cable — this is not supported "
-            "over Bluetooth yet.",
+            "This needs a USB cable. The controller is either not connected or "
+            "connected over Bluetooth, where this is not supported yet.",
         )
         return None
 
     def _test_rumble(self, _):
-        usb = self._wired_transport("Rumble")
-        if usb is None:
+        if not self.bridge.is_connected:
+            self._tell("Rumble", "Connect a controller first.")
             return
 
         def demo():
@@ -1651,12 +1729,16 @@ class Switch2BridgeApp(rumps.App):
             # app that freezes while buzzing would look like a crash.
             try:
                 for amplitude in (18000, 40000, 0xFFFF):
-                    usb.set_rumble(amplitude, amplitude)
+                    if not self.bridge.set_rumble(amplitude, amplitude):
+                        return
                     time.sleep(0.3)
-                usb.set_rumble(0, 0)
+                self.bridge.set_rumble(0, 0)
             except Exception:
                 log.exception("rumble test failed")
 
+        if not self.bridge.set_rumble(0, 0):
+            self._tell("Rumble", "The controller is not connected.")
+            return
         threading.Thread(target=demo, name="rumble-test", daemon=True).start()
 
     def _pair_controller(self, _):
@@ -1665,7 +1747,7 @@ class Switch2BridgeApp(rumps.App):
             return
         host = controller_pairing.local_bluetooth_address()
         if host is None:
-            self._notify("Pairing", "Could not read this Mac's Bluetooth address.")
+            self._tell("Pairing", "Could not read this Mac's Bluetooth address.")
             return
 
         # Verify before asking. Step three of the exchange is a cryptographic
@@ -1676,7 +1758,7 @@ class Switch2BridgeApp(rumps.App):
             usb.run_pairing(host, commit=False)
         except Exception as e:
             log.exception("pairing dry run failed")
-            self._notify("Pairing failed", str(e))
+            self._tell("Pairing failed", str(e))
             return
 
         confirmed = rumps.alert(
@@ -1701,9 +1783,9 @@ class Switch2BridgeApp(rumps.App):
             usb.run_pairing(host, commit=True)
         except Exception as e:
             log.exception("pairing failed")
-            self._notify("Pairing failed", str(e))
+            self._tell("Pairing failed", str(e))
             return
-        self._notify(
+        self._tell(
             "Paired",
             f"The controller now knows this Mac ({controller_pairing.format_address(host)}).",
         )

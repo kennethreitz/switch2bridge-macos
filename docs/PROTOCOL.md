@@ -556,13 +556,47 @@ so the LTK differs each time — but it is determined entirely by the host, sinc
 the controller's contribution is fixed. Anyone who can see `A1` on the wire
 knows the resulting key. Worth knowing before treating the LTK as a secret.
 
+## Rumble over Bluetooth, on its own characteristic
+
+Rumble does **not** go through the command channel over BLE either. It has a
+dedicated characteristic:
+
+```
+cc483f51-9258-427d-a939-630c31f72b05   write-without-response   vibration
+```
+
+Write-without-response, so nothing acknowledges a malformed frame — the same
+"succeeds and does nothing" shape as the other two paths, with no reply at all
+this time.
+
+The payload is a leading `0x00` and then one 16-byte block per actuator:
+
+```
+[0]       0x00
+[1:17]    left  block: 0x50 | (sequence & 0x0F), then a 5-byte HD frame
+[17:33]   right block: the same
+```
+
+The HD frame is identical to the wired one. Three candidate framings were
+tried on hardware, each buzzing a different number of times so a person could
+say which fired:
+
+| Candidate | Result |
+|---|---|
+| sequence byte + one frame per block | **works** |
+| sequence byte + the frame repeated three times | **works** |
+| three frames from offset 0, no sequence byte | nothing |
+
+So the sequence byte is required rather than padding, and one frame per block
+is enough. Frames still have to be repeated to sustain an effect, but at a
+slower cadence than wired: the connection interval is 30 ms, so writing faster
+than that only queues frames the radio cannot carry.
+
 ## Still unsolved
 
 * **Exiting pairing mode** — the controller keeps advertising, so a nearby
   console reconnects to it. Wired sidesteps it entirely
-* **Rumble over Bluetooth** — the wired path above is verified; the BLE
-  equivalent writes the same frames to a vibration characteristic and is not
-  implemented here yet
+* ~~**Rumble over Bluetooth**~~ — solved, see below
 * **Motion over Bluetooth** — see below; selecting report `0x05` is accepted
   but changes nothing, so on this firmware motion is USB-only so far
 

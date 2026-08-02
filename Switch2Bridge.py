@@ -74,7 +74,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.9.1"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.10.0"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -599,6 +599,9 @@ class ControllerBridge:
         self._rumble_state = (0, 0)
         self._rumble_lock = threading.Lock()
         self._rumble_seq = 0
+        # Factory gyro bias in deg/s, read from the controller when wired.
+        # Zeros are a safe default: unbiased gyro is slightly drifty, not wrong.
+        self.gyro_bias_dps = (0.0, 0.0, 0.0)
         self.usb = None            # USBTransport while wired
         self.transport = None      # "usb" or "ble" once connected
         self.is_connected = False
@@ -737,6 +740,47 @@ class ControllerBridge:
             triple(m.motion_gyro_offset, m.motion_gyro_scale),
         )
 
+    def _build_state_05(self, data: bytes):
+        """Decode a report 0x05 body — the format that carries motion.
+
+        Kept separate from the legacy decoder rather than merged into it: the
+        two layouts share only the 12-bit stick packing, and folding them
+        together would mean a branch in every field.
+        """
+        raw = int.from_bytes(data[cc.R05_BUTTONS:cc.R05_BUTTONS + 4], "little")
+        buttons = {name: bool(raw & (1 << bit)) for bit, name in cc.R05_BUTTON_BITS}
+
+        lx_raw, ly_raw = cc.unpack_pair(
+            data[cc.R05_LEFT_STICK:cc.R05_LEFT_STICK + 3])
+        rx_raw, ry_raw = cc.unpack_pair(
+            data[cc.R05_RIGHT_STICK:cc.R05_RIGHT_STICK + 3])
+
+        cal = self.calibration
+        cal.observe({'lx': lx_raw, 'ly': ly_raw, 'rx': rx_raw, 'ry': ry_raw})
+        deadzone = self.mappings.stick_deadzone
+        saturation = self.mappings.stick_saturation
+        lx, ly = shape_stick(
+            cal.value('lx', lx_raw), cal.value('ly', ly_raw), deadzone, saturation
+        )
+        rx, ry = shape_stick(
+            cal.value('rx', rx_raw), cal.value('ry', ry_raw), deadzone, saturation
+        )
+
+        # The sensor clock is the liveness signal: a disabled IMU latches its
+        # last sample, so the accelerometer keeps reading a plausible gravity
+        # vector while nothing updates. Reporting that as live motion would
+        # hand DSU clients a frozen orientation and look like working gyro.
+        if cc.report05_sensor_timestamp(data):
+            accel, gyro = cc.decode_report05_motion(data, self.gyro_bias_dps)
+        else:
+            accel, gyro = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+
+        return ControllerState(
+            buttons=buttons, lx=lx, ly=ly, rx=rx, ry=ry,
+            accel=accel, gyro=gyro,
+            timestamp_us=monotonic_us(),
+        )
+
     def _build_state(self, data: bytes):
         """Decode one BLE report into a neutral ControllerState."""
         buttons = {
@@ -768,7 +812,14 @@ class ControllerBridge:
             timestamp_us=monotonic_us(),
         )
 
-    def _on_data(self, sender, data: bytes):
+    def _on_data(self, sender, data: bytes, motion_format=False):
+        """Handle one input report.
+
+        `motion_format` says the body is report 0x05 rather than the legacy
+        layout. It is passed by the transport that asked for that report,
+        because the two formats are not distinguishable from the body alone
+        once the HID report id has been stripped.
+        """
         if len(data) < self.MIN_REPORT_LEN:
             return
 
@@ -780,7 +831,8 @@ class ControllerBridge:
                      self._raw_remaining, len(data), bytes(data).hex())
 
         try:
-            state = self._build_state(data)
+            state = (self._build_state_05(data) if motion_format
+                     else self._build_state(data))
         except Exception:
             log.exception("failed to decode report: %s", bytes(data).hex())
             return
@@ -1048,7 +1100,8 @@ class ControllerBridge:
             return False
 
         def on_report(body):
-            self._on_data(None, body)
+            # Wired asks for report 0x05, the format that carries motion.
+            self._on_data(None, body, motion_format=True)
 
         def on_error(message):
             self.last_error = message
@@ -1070,6 +1123,7 @@ class ControllerBridge:
             left, right = transport.read_stick_calibration()
             if self.calibration.apply_factory(left, right):
                 self.last_notice = "Stick calibration read from controller"
+        self.gyro_bias_dps = transport.read_gyro_bias()
         transport.set_player_light(self.mappings.player_light)
         self.usb = transport
         self.transport = "usb"

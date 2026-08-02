@@ -281,10 +281,10 @@ DSU is the path that works today, on an unsigned build, with no permissions.
 | Analog sticks | ✅ Working | Full 12-bit analog over DSU, calibrated |
 | C / GL / GR | ✅ Decoded | No native DSU slot — alias them onto a DSU button |
 | Keyboard bridge | ✅ Optional | Off by default; 8-direction sticks only |
-| Motion / Gyro | ❌ Not available | Bytes 12–111 of the input report are zero in every capture. Either the IMU needs enabling via a write endpoint, or it streams on one of the six unsubscribed notify channels. Plumbing and configurable offsets exist — see `motion` in `mappings.json` |
-| LED control | ❌ Not working | No command has been sent yet — the bridge writes nothing at all |
-| Rumble | ❌ Not working | Same cause |
-| Battery level | ❌ Not decoded | Not located in the report yet |
+| Motion / Gyro | ✅ Wired only | Accel and gyro reach DSU over USB at 250 Hz, with the factory gyro bias read from the controller. It needs input report `0x05`, a second report format the controller only streams over USB — selecting it over Bluetooth is accepted and changes nothing, so there is no motion on the radio |
+| Player LEDs | ✅ Working | Set on connect from `player_light` in `mappings.json` |
+| Rumble | ✅ Working | HD rumble on both transports. Driven by DSU's rumble messages, or *Test rumble* in the menu. Note few DSU clients send rumble yet |
+| Battery level | ✅ Decoded (wired) | Millivolts at bytes 31-32 of report `0x05`; not yet surfaced in the UI |
 | **Exiting pairing mode** | ❌ Not working | The bridge never claims the controller, so it keeps advertising and a nearby Switch will reconnect to it over Bluetooth Classic. See below |
 | Native HID | ❌ Not possible | Requires an Apple-restricted entitlement — see above |
 

@@ -315,3 +315,70 @@ check("unset side keeps default centre", cal_one.centers['rx'] == STICK_RAW_CENT
 # a reset must not discard calibration read from flash
 cal.reset()
 check("reset keeps factory travel", cal.travel_pos['lx'] == 1654)
+
+# ============ input report 0x05 ============
+# The format that carries motion. Bytes below are a real report captured from
+# a Pro 2 over USB, with the HID report-id byte stripped as the transport does.
+print("== report 0x05 ==")
+import controller_commands as CC
+
+# Stored with its report-id byte and stripped here rather than by hand: an
+# off-by-one while transcribing shifts every field and still decodes to
+# plausible-looking numbers, which is exactly what happened writing this.
+FULL_REPORT05 = bytes.fromhex(
+    "05d7560200000000000000c0d78687188700000000000000000000000000"
+    "0000a00e340000000000000001c8f03d0604005e04fa04e20e0a00fdfffcff000000"
+)
+REPORT05 = FULL_REPORT05[1:]
+
+check("0x05 sample has a report id", FULL_REPORT05[0] == CC.MOTION_REPORT_ID,
+      hex(FULL_REPORT05[0]))
+check("0x05 sample is a full report", len(REPORT05) == 63, len(REPORT05))
+
+lx, ly = CC.unpack_pair(REPORT05[CC.R05_LEFT_STICK:CC.R05_LEFT_STICK + 3])
+rx, ry = CC.unpack_pair(REPORT05[CC.R05_RIGHT_STICK:CC.R05_RIGHT_STICK + 3])
+check("0x05 left stick near centre", 1800 < lx < 2300 and 1900 < ly < 2400, (lx, ly))
+check("0x05 right stick near centre", 2000 < rx < 2400 and 2000 < ry < 2400, (rx, ry))
+
+check("0x05 battery reads a sane voltage",
+      3000 < CC.report05_battery_mv(REPORT05) < 4300,
+      CC.report05_battery_mv(REPORT05))
+check("0x05 sensor timestamp present",
+      CC.report05_sensor_timestamp(REPORT05) > 0,
+      CC.report05_sensor_timestamp(REPORT05))
+
+accel, gyro = CC.decode_report05_motion(REPORT05)
+magnitude = sum(a * a for a in accel) ** 0.5
+# The controller was resting on a desk, so the accelerometer must read 1g.
+# This is the check that catches a wrong offset or a bad scale factor, both of
+# which still produce plausible-looking numbers.
+check("0x05 accel magnitude is 1g at rest", 0.9 < magnitude < 1.1, magnitude)
+check("0x05 gyro is near zero at rest",
+      all(abs(g) < 5.0 for g in gyro), gyro)
+
+# Truncation must cost a frame of motion, not the input stream.
+short_accel, short_gyro = CC.decode_report05_motion(REPORT05[:20])
+check("0x05 short body decodes as no motion",
+      short_accel == (0.0, 0.0, 0.0) and short_gyro == (0.0, 0.0, 0.0))
+check("0x05 short body has no timestamp",
+      CC.report05_sensor_timestamp(REPORT05[:20]) == 0)
+
+# Bias is subtracted, in deg/s.
+_, biased = CC.decode_report05_motion(REPORT05, gyro_bias_dps=(1.0, 2.0, 3.0))
+check("0x05 gyro bias is subtracted",
+      abs((gyro[0] - 1.0) - biased[0]) < 1e-6, (gyro[0], biased[0]))
+
+# Buttons: nothing held in this capture.
+raw = int.from_bytes(REPORT05[CC.R05_BUTTONS:CC.R05_BUTTONS + 4], "little")
+pressed = [n for bit, n in CC.R05_BUTTON_BITS if raw & (1 << bit)]
+check("0x05 no buttons pressed in the resting capture", pressed == [], pressed)
+
+# And the bit table itself, against the layout documented for report 0x05.
+def bits_for(names):
+    return {n: bit for bit, n in CC.R05_BUTTON_BITS if n in names}
+table = bits_for({'HOME', 'CAPT', 'C', 'GR', 'GL'})
+check("0x05 Capture comes before C", table['CAPT'] < table['C'], table)
+check("0x05 home/capture/C are adjacent",
+      (table['HOME'], table['CAPT'], table['C']) == (12, 13, 14), table)
+check("0x05 grip buttons are in the top byte",
+      (table['GR'], table['GL']) == (24, 25), table)

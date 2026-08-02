@@ -507,7 +507,11 @@ class FakeUSB:
         return True
     def read_stick_calibration(self):
         return None, None
+    def read_gyro_bias(self):
+        return (0.0, 0.0, 0.0)
     def set_player_light(self, pattern):
+        pass
+    def set_rumble(self, low, high):
         pass
     def disconnect(self):
         self.connected = False

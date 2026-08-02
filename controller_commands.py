@@ -17,6 +17,7 @@ calibration, and the player-lights command visibly changes the LEDs.
 """
 
 import logging
+import struct
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +76,82 @@ def parse_spi_reply(reply):
     length = reply[8]
     address = int.from_bytes(reply[12:16], "little")
     return address, reply[FRAME_LEN:FRAME_LEN + length]
+
+
+# --- input report 0x05 ---
+#
+# A second input format, and the only one that carries motion. Offsets below
+# are into the report *body*, i.e. with the USB HID report-id byte already
+# stripped, so they are one lower than the numbers in SDL's driver.
+#
+# This is a different layout from the report the Bluetooth path reads, not an
+# extension of it: the sticks move, the counter widens to four bytes, and the
+# buttons become a single u32. Hence a separate decoder rather than extra
+# fields on the existing one.
+
+MOTION_REPORT_ID = 0x05
+
+R05_COUNTER = 0          # u32
+R05_BUTTONS = 4          # u32
+R05_LEFT_STICK = 10      # 3 bytes, same 12-bit packing as report 0x09
+R05_RIGHT_STICK = 13
+R05_BATTERY_MV = 31      # u16, millivolts
+R05_SENSOR_TIMESTAMP = 0x2A   # u32; the only trustworthy IMU liveness signal
+R05_ACCEL = 0x30         # X, then Z (negated), then Y — three i16
+R05_GYRO = 0x36          # X, then Y (negated), then Z — three i16
+R05_MIN_LEN = R05_GYRO + 6
+
+# One g over a +/-8g 16-bit range, and degrees/sec per count. The gyro figure
+# is SDL's 34.8 rad/s full scale converted to deg/s, which lands on the 1/16.4
+# these mappings already defaulted to.
+ACCEL_COUNTS_PER_G = 4096.0
+GYRO_COUNTS_PER_DPS = 16.4
+
+# Report 0x05 packs every button into one u32. Bit numbers per ndeadly's
+# hid_reports.md, cross-checked against SDL and murphyjt/wavebird.
+R05_BUTTON_BITS = (
+    (0, 'Y'), (1, 'X'), (2, 'B'), (3, 'A'),
+    (6, 'R'), (7, 'ZR'),
+    (8, '-'), (9, '+'), (10, 'RS'), (11, 'LS'),
+    (12, 'HOME'), (13, 'CAPT'), (14, 'C'),
+    (16, 'DDOWN'), (17, 'DUP'), (18, 'DRIGHT'), (19, 'DLEFT'),
+    (22, 'L'), (23, 'ZL'),
+    (24, 'GR'), (25, 'GL'),
+)
+
+
+def decode_report05_motion(body, gyro_bias_dps=(0.0, 0.0, 0.0)):
+    """(accel in g, gyro in deg/s) from a report 0x05 body.
+
+    Axis order and the two negations follow SDL. Returns zeros when the body
+    is too short rather than raising, since a truncated report should cost a
+    frame of motion and not the whole input stream.
+    """
+    if len(body) < R05_MIN_LEN:
+        return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+    ax, az, ay = struct.unpack_from("<3h", body, R05_ACCEL)
+    gx, gy, gz = struct.unpack_from("<3h", body, R05_GYRO)
+    accel = (ax / ACCEL_COUNTS_PER_G,
+             ay / ACCEL_COUNTS_PER_G,
+             -az / ACCEL_COUNTS_PER_G)
+    gyro = (gx / GYRO_COUNTS_PER_DPS - gyro_bias_dps[0],
+            -gy / GYRO_COUNTS_PER_DPS - gyro_bias_dps[1],
+            gz / GYRO_COUNTS_PER_DPS - gyro_bias_dps[2])
+    return accel, gyro
+
+
+def report05_sensor_timestamp(body):
+    """The IMU's own clock. Static means motion is off, whatever accel says."""
+    if len(body) < R05_SENSOR_TIMESTAMP + 4:
+        return 0
+    return int.from_bytes(
+        body[R05_SENSOR_TIMESTAMP:R05_SENSOR_TIMESTAMP + 4], "little")
+
+
+def report05_battery_mv(body):
+    if len(body) < R05_BATTERY_MV + 2:
+        return 0
+    return int.from_bytes(body[R05_BATTERY_MV:R05_BATTERY_MV + 2], "little")
 
 
 # --- HD rumble ---

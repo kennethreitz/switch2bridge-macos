@@ -28,6 +28,7 @@ protocol reference only.
 import controller_commands as cc
 import controller_pairing as cp
 import logging
+import struct
 import sys
 import threading
 import time
@@ -42,7 +43,15 @@ COMMAND_INTERFACE = 1
 ENDPOINT_OUT = 0x02
 ENDPOINT_IN = 0x82
 
-INPUT_REPORT_ID = 0x09
+# Report 0x05 rather than 0x09: it is the only format that carries motion, and
+# the body is a different layout, so the bridge parses it with its own decoder.
+INPUT_REPORT_ID = cc.MOTION_REPORT_ID
+
+# Factory gyro bias: three float32 at offsets 4, 8, 12 of the block at
+# 0x00013040, in rad/s. Not the 0x001FC000 motion block, which is erased.
+FACTORY_GYRO_BIAS = 0x00013040
+GYRO_BIAS_OFFSET = 4
+RAD_TO_DEG = 57.29577951308232
 
 # Transport byte (header offset 2) is 0x00 for USB, 0x01 for Bluetooth.
 TRANSPORT_USB = 0x00
@@ -216,6 +225,49 @@ class USBTransport:
         left = cc.decode_stick_block(spi(cc.FACTORY_STICK_LEFT, cc.STICK_BLOCK_LEN))
         right = cc.decode_stick_block(spi(cc.FACTORY_STICK_RIGHT, cc.STICK_BLOCK_LEN))
         return left, right
+
+    def read_gyro_bias(self):
+        """Factory gyro bias in deg/s, or zeros if it cannot be read.
+
+        Zeros are a fine fallback — the gyro is then slightly drifty rather
+        than wrong — so this never fails the connection.
+        """
+        if self._device is None:
+            return (0.0, 0.0, 0.0)
+        try:
+            self._device.write(
+                ENDPOINT_OUT,
+                cc.spi_read_command(FACTORY_GYRO_BIAS + GYRO_BIAS_OFFSET, 12),
+                1000,
+            )
+        except Exception as e:
+            log.warning("gyro bias read failed: %s", e)
+            return (0.0, 0.0, 0.0)
+        for _attempt in range(4):
+            try:
+                reply = bytes(self._device.read(ENDPOINT_IN, 96, 500))
+            except Exception:
+                return (0.0, 0.0, 0.0)
+            parsed = cc.parse_spi_reply(reply)
+            if not parsed or parsed[0] != FACTORY_GYRO_BIAS + GYRO_BIAS_OFFSET:
+                continue
+            data = parsed[1]
+            if len(data) < 12:
+                return (0.0, 0.0, 0.0)
+            try:
+                x, y, z = struct.unpack_from("<3f", data, 0)
+            except Exception:
+                return (0.0, 0.0, 0.0)
+            bias = (x * RAD_TO_DEG, y * RAD_TO_DEG, z * RAD_TO_DEG)
+            # A plausible bias is a fraction of a degree per second. Anything
+            # larger means the block was misread, and applying it would drag
+            # the gyro rather than correct it.
+            if any(abs(v) > 5.0 for v in bias):
+                log.info("ignoring implausible gyro bias %s", bias)
+                return (0.0, 0.0, 0.0)
+            log.info("gyro bias %.3f, %.3f, %.3f deg/s", *bias)
+            return bias
+        return (0.0, 0.0, 0.0)
 
     def _run_init(self):
         replies = 0

@@ -69,6 +69,9 @@ def main(host, port, seconds):
     print(f"\nStreaming for {seconds}s — move the sticks and press buttons.\n")
     peak = 0.0
     peaks = {"LX": 0.0, "LY": 0.0, "RX": 0.0, "RY": 0.0}
+    # Motion peaks are reported separately: sticks are judged against
+    # full deflection, the IMU against gravity and against zero at rest.
+    peaks.update({"|a|": 0.0, "gyro": 0.0})
     count = 0
     deadline = time.monotonic() + seconds
     last_sub = 0.0
@@ -98,23 +101,46 @@ def main(host, port, seconds):
             held.append("PS")
         if pkt[39]:
             held.append("Touch")
-        gyro = struct.unpack_from("<6f", pkt, 76)
+        ax, ay, az, gp, gy, gr = struct.unpack_from("<6f", pkt, 76)
+        # An accelerometer at rest reads 1g. Showing the magnitude rather than
+        # just "motion: yes" is what tells a working IMU from a wrong offset,
+        # since a bad decode still produces confident-looking numbers.
+        magnitude = (ax * ax + ay * ay + az * az) ** 0.5
+        peaks["|a|"] = max(peaks["|a|"], magnitude)
+        peaks["gyro"] = max(peaks["gyro"], abs(gp), abs(gy), abs(gr))
+
+        if magnitude:
+            motion = f"|a|={magnitude:.2f}g gyro({gp:+6.1f},{gy:+6.1f},{gr:+6.1f})"
+        else:
+            motion = "motion: none"
 
         line = (f"L({lx:+.2f},{ly:+.2f}) R({rx:+.2f},{ry:+.2f})  "
-                f"motion={'yes' if any(gyro) else 'no '}  "
-                f"{' '.join(held) if held else '-'}")
-        print(f"\r{line:<90}", end="", flush=True)
+                f"{motion}  {' '.join(held) if held else '-'}")
+        print(f"\r{line:<110}", end="", flush=True)
 
     print(f"\n\n📊 {count} packets received")
     if not count:
         print("   ❌ Nothing arrived — the pad is not streaming.")
         return 1
     print("   Peak deflection per axis (1.00 means full range is reachable):")
-    for name, value in peaks.items():
+    for name, value in list(peaks.items()):
+        if name in ("|a|", "gyro"):
+            continue
         flag = "✅" if value > 0.98 else ("•" if value > 0.5 else " ")
         print(f"     {flag} {name}: {value:.2f}")
     if peak <= 0.5:
         print("   (sticks barely moved — push them to the edges to test range)")
+
+    print("\n   Motion:")
+    if not peaks["|a|"]:
+        print("     ❌ no motion in the stream — wired only, so check the cable")
+    else:
+        ok = 0.85 < peaks["|a|"] < 1.25
+        print(f"     {'✅' if ok else '⚠️ '} peak |accel| {peaks['|a|']:.2f}g "
+              f"(about 1.00 at rest means the decode is right)")
+        turned = peaks["gyro"] > 20.0
+        print(f"     {'✅' if turned else '•'} peak gyro {peaks['gyro']:.0f} deg/s"
+              f"{'' if turned else '  (turn the controller to exercise it)'}")
     return 0
 
 

@@ -390,6 +390,28 @@ cfg_usb["controller"]["usb"] = False
 m_off = M(); m_off._apply(cfg_usb)
 check("usb:false honoured", m_off.usb_enabled is False)
 
+print("== rate log flag ==")
+S2B.MAPPINGS_FILE.write_text(json.dumps(M.DEFAULT))
+m_rate = M()
+check("rate log loads off", m_rate.load() is True and m_rate.rate_log is False)
+m_rate.set_rate_log(True)
+stored = json.loads(S2B.MAPPINGS_FILE.read_text())
+check("rate log persisted", stored["controller"]["rate_log"] is True)
+m_rate2 = M()
+check("rate log reloads", m_rate2.load() is True and m_rate2.rate_log is True)
+
+print("== rate meter hooked up ==")
+br_m = S2B.ControllerBridge(mm)
+body = bytearray(11)
+body[0] = 10
+br_m._on_data(None, bytes(body))
+body[0] = 12  # skipped 11
+br_m._on_data(None, bytes(body))
+snap = br_m.rate_meter.summary()
+check("bridge meter sees both reports", snap is not None and snap["count"] == 2, snap)
+check("bridge meter counts the skipped counter",
+      snap is not None and snap["skipped"] == 1, snap)
+
 # the wired report is the bluetooth report with a HID report id in front
 body = bytes.fromhex("7e23000000b8378472688638") + bytes(51)
 check("usb body decodes with the same parser",

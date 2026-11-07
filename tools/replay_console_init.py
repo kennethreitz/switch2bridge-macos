@@ -17,6 +17,10 @@ Measures, before and after:
     30 ms connection interval macOS negotiates
   * whether bytes past the button/stick block become non-zero (motion)
 
+Does not write the `85 00` descriptor a later console capture shows on
+ATT handle 0x0010. That write is `tools/measure_rate.py
+--write-rate-descriptor`, and it is not expected to move the interval.
+
     python3 tools/replay_console_init.py            # dry run, prints the plan
     python3 tools/replay_console_init.py --go
 

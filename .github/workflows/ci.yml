@@ -30,6 +30,9 @@ jobs:
       - name: DSU server tests (cemuhook protocol over UDP)
         run: python tests/test_dsu.py
 
+      - name: Report rate meter
+        run: python tests/test_report_rate.py
+
   build:
     name: Build .app + DMG
     runs-on: macos-14

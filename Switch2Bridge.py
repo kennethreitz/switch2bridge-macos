@@ -57,6 +57,7 @@ from controller_state import (
 import controller_commands as cc
 from dsu_server import ALIASABLE_BUTTONS, DSUServer
 from outputs import SPECIAL_KEY_NAMES, KeyboardOutput, pynput_available
+from report_rate import ReportRateMeter
 import usb_transport
 
 SMAppService = None
@@ -71,7 +72,7 @@ except ImportError:
 # ============================================================
 
 APP_NAME = "Switch2 Bridge"
-APP_VERSION = "1.8.0"  # single source of truth — read by setup_app.py & build_dmg.sh
+APP_VERSION = "1.8.1"  # single source of truth — read by setup_app.py & build_dmg.sh
 INPUT_CHAR_UUID = "7492866c-ec3e-4619-8258-32755ffcc0f9"
 
 # Nintendo company identifiers seen in BLE advertisements:
@@ -141,6 +142,9 @@ class Mappings:
             # as soon as it appears; Bluetooth gets one search at launch,
             # since it needs the pair button held anyway.
             "auto_connect": True,
+            # Log arrival rate, the gap, and skipped byte-0 counters.
+            # Off by default; the menu bar item toggles it.
+            "rate_log": False,
         },
         "motion": {
             # The Switch 2 IMU layout is not confirmed. Run
@@ -195,6 +199,7 @@ class Mappings:
         self.player_light = 1
         self.usb_enabled = True
         self.auto_connect = True
+        self.rate_log = False
         self.left_stick = {}
         self.right_stick = {}
         self.dsu_enabled = True
@@ -428,6 +433,7 @@ class Mappings:
         self.player_light = light
         self.usb_enabled = bool(controller.get("usb", True))
         self.auto_connect = bool(controller.get("auto_connect", True))
+        self.rate_log = bool(controller.get("rate_log", False))
 
         keyboard_cfg = cfg.get("keyboard", {})
         if not isinstance(keyboard_cfg, dict):
@@ -485,6 +491,11 @@ class Mappings:
         """Persist the keyboard-bridge toggle back into mappings.json."""
         self.keyboard_enabled = bool(enabled)
         self._persist_flag("keyboard", "enabled", self.keyboard_enabled)
+
+    def set_rate_log(self, enabled):
+        """Persist the report-rate log toggle back into mappings.json."""
+        self.rate_log = bool(enabled)
+        self._persist_flag("controller", "rate_log", self.rate_log)
 
     @staticmethod
     def _persist_flag(block, key, value):
@@ -570,6 +581,8 @@ class ControllerBridge:
     CONFIG_TIMEOUT = 3.0
     # How many raw reports "Capture raw packets" writes to the log
     RAW_CAPTURE_LIMIT = 300
+    # How often "Log report rate" writes a summary while it is on
+    RATE_LOG_PERIOD = 5.0
 
     def __init__(self, mappings: Mappings, dsu: DSUServer = None,
                  keyboard_output=None):
@@ -592,6 +605,8 @@ class ControllerBridge:
         self.is_reconnecting = False
         self.controller_name = None
         self.packet_count = 0
+        self.rate_meter = ReportRateMeter()
+        self._rate_log_next = 0.0
         # Set by worker, read & cleared by the main-thread UI tick
         self.last_error = None
         self.last_notice = None
@@ -772,9 +787,11 @@ class ControllerBridge:
         self.last_state = state
 
         # Fan out. One failing backend must not stop the others.
+        # DSU is unpaced: one datagram per report, no timer and no coalescing.
+        dsu_targets = 0
         if self.dsu is not None and self.dsu.running:
             try:
-                self.dsu.push(state)
+                dsu_targets = self.dsu.push(state) or 0
             except Exception:
                 log.exception("DSU push failed")
         if self.keyboard is not None and self.keyboard.enabled:
@@ -782,6 +799,25 @@ class ControllerBridge:
                 self.keyboard.push(state)
             except Exception:
                 log.exception("keyboard push failed")
+
+        # Measurement only. A failure here must not drop the report already
+        # forwarded, and it must not change the wired or wireless path.
+        try:
+            self.rate_meter.observe(data[0], time.monotonic(), dsu_targets > 0)
+            if self.mappings.rate_log:
+                self._maybe_log_rate()
+        except Exception:
+            log.exception("report rate meter failed")
+
+    def _maybe_log_rate(self):
+        now = time.monotonic()
+        if now < self._rate_log_next:
+            return
+        line = self.rate_meter.format_line(self.transport or "?")
+        if not line:
+            return
+        self._rate_log_next = now + self.RATE_LOG_PERIOD
+        log.info("%s", line)
 
     # --- discovery ---
 
@@ -834,11 +870,18 @@ class ControllerBridge:
                 self.last_error = "Failed to connect to controller."
                 return False
 
+            self.rate_meter.reset()
+            self._rate_log_next = 0.0
+            # Set before subscribe so the first notifications are labeled.
+            # Cleared below if subscribe fails; the session's success path
+            # assigns it again once we are actually up.
+            self.transport = "ble"
             try:
                 await client.start_notify(INPUT_CHAR_UUID, self._on_data)
             except Exception as e:
                 log.exception("start_notify failed")
                 self.last_error = f"Connection error: {e}"
+                self.transport = None
                 return False
 
             # Re-learn the resting centre for each new session: the drift is
@@ -926,7 +969,13 @@ class ControllerBridge:
             self.last_error = message
 
         transport = usb_transport.USBTransport(on_report, on_error)
+        # The reader thread starts inside connect(), so label the transport
+        # first. A failed claim must not leave us marked wired.
+        self.transport = "usb"
+        self.rate_meter.reset()
+        self._rate_log_next = 0.0
         if not transport.connect():
+            self.transport = None
             if transport.last_error:
                 log.info("wired connect failed: %s", transport.last_error)
                 self.last_notice = "USB found but unavailable — using Bluetooth"
@@ -1173,6 +1222,9 @@ class Switch2BridgeApp(rumps.App):
         self._capture_item = rumps.MenuItem(
             "Capture raw packets", callback=self._toggle_raw_capture
         )
+        self._rate_item = rumps.MenuItem(
+            "Log report rate", callback=self._toggle_rate_log
+        )
         self._login_item = rumps.MenuItem("Start at Login", callback=self._toggle_login)
         self._logs_item = rumps.MenuItem("Open logs…", callback=self._open_logs)
         self._version_item = rumps.MenuItem(f"{APP_NAME} v{APP_VERSION}")
@@ -1193,6 +1245,7 @@ class Switch2BridgeApp(rumps.App):
             self._recal_item,
             None,
             self._capture_item,
+            self._rate_item,
             self._login_item,
             self._logs_item,
             None,
@@ -1201,6 +1254,7 @@ class Switch2BridgeApp(rumps.App):
         ]
         self._sync_dsu()
         self._sync_keyboard(prompt=False)  # first tick prompts, once the UI is up
+        self._sync_rate_item()
         self._sync_login_item()
         # packets/s: sampled by the UI tick
         self._rate_prev_count = 0
@@ -1346,6 +1400,12 @@ class Switch2BridgeApp(rumps.App):
             rate = max(0.0, (count - self._rate_prev_count) / elapsed) if elapsed > 0 else 0.0
             self._rate_prev_count, self._rate_prev_time = count, now
             detail = f"   {count} pkts · {rate:.0f}/s"
+            if self.mappings.rate_log:
+                snap = self.bridge.rate_meter.summary()
+                if snap and snap["count"] >= 20 and snap["span_s"] >= 1.0:
+                    detail += f" · gap {snap['gap_p50_ms']:.0f}ms"
+                    if snap["skipped"]:
+                        detail += f" · skip {snap['skipped']}"
             clients = self.dsu.client_count() if self.dsu.running else 0
             if clients:
                 detail += f" · DSU: {clients} client{'s' if clients > 1 else ''}"
@@ -1492,6 +1552,7 @@ class Switch2BridgeApp(rumps.App):
         ok = self.mappings.load()
         self._sync_dsu()
         self._sync_keyboard()
+        self._sync_rate_item()
         self._surface_mappings_messages()
         if ok:
             self._notify("Mappings reloaded", f"Loaded from {MAPPINGS_FILE.name}")
@@ -1555,6 +1616,20 @@ class Switch2BridgeApp(rumps.App):
                 f"to bridge.log.",
             )
         self._capture_item.state = 1 if self.bridge.raw_capture_active else 0
+
+    def _sync_rate_item(self):
+        self._rate_item.state = 1 if self.mappings.rate_log else 0
+
+    def _toggle_rate_log(self, _):
+        self.mappings.set_rate_log(not self.mappings.rate_log)
+        self._sync_rate_item()
+        if self.mappings.rate_log:
+            self.bridge._rate_log_next = 0.0
+            self._notify(
+                "Report rate",
+                "Logging Hz, gap, and skipped counters to bridge.log "
+                "every few seconds.",
+            )
 
     def _login_service(self):
         """SMAppService for the main app, or None when unavailable.

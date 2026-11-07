@@ -249,6 +249,28 @@ srv.push(state({"GL": 1, "C": 1}))
 pkt, _ = cli.recvfrom(1024)
 check("alias: unmapped GL/C emit nothing", pkt[37] == 0 and pkt[38] == 0)
 
+# ============ the server does not pace or coalesce ============
+print("== no coalescing ==")
+drain(cli)
+burst = 40
+sent = [srv.push(state(buttons, timestamp_us=i + 1)) for i in range(burst)]
+check("push returns a client count", sent[0] == 1 and all(n == 1 for n in sent), sent[0])
+got = 0
+cli.settimeout(0.05)
+try:
+    while True:
+        cli.recvfrom(2048)
+        got += 1
+except socket.timeout:
+    pass
+cli.settimeout(2.0)
+check("dsu forwards every push", got == burst, got)
+
+lonely = DSUServer(port=0)
+check("lonely start", lonely.start() is True)
+check("push with no client returns 0", lonely.push(state(buttons)) == 0)
+lonely.stop()
+
 # stop
 srv.stop()
 check("stop: not running", not srv.running)

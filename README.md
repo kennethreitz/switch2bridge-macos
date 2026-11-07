@@ -52,9 +52,11 @@ The Nintendo Switch 2 Pro Controller (vendor `0x057E`, product `0x2069`) does no
 |--------|--------|-------|
 | USB | Works | Enumerates, then stays silent until an init sequence is sent to its **vendor-class interface** (interface 1), not the HID interface. This app does that: 250 Hz, 4 ms |
 | Bluetooth Classic | Not available | The controller advertises BR/EDR as unsupported. It is BLE only |
-| Bluetooth LE | Works | Custom BLE client. About 33 Hz, because macOS negotiates a 30 ms connection interval and CoreBluetooth does not let an app change it |
+| Bluetooth LE | Works | Custom BLE client. About 33 Hz. macOS negotiates a 30 ms connection interval, the controller sends one report per event, and CoreBluetooth does not let an app change it. 250 Hz is USB only |
 
-Wired is preferred when the cable is plugged in. It is about 7x the Bluetooth rate, and a nearby console cannot take the controller back while it is wired. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
+Wired is preferred when the cable is plugged in. It is about 7x the Bluetooth rate, and a nearby console cannot take the controller back while it is wired.
+
+250 Hz is not available over Bluetooth. The controller's own link to a Switch 2 is 200 Hz at a 5 ms interval, which is below the BLE minimum, and macOS will not negotiate it. The best this app can do on CoreBluetooth is the ~33 Hz the Mac already grants. **Log report rate** in the menu bar records the gap and whether any reports were skipped. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Requirements
 
@@ -262,6 +264,7 @@ python3 tools/capture_packets.py     # guided capture, writes capture.jsonl
 python3 tools/analyze_capture.py     # per-byte variance, button bits, stick extents
 python3 tools/live_buttons.py        # which bits are set as you press
 python3 tools/read_calibration.py    # factory stick blocks over BLE
+python3 tools/measure_rate.py        # BLE gap and skipped counters (dry run)
 ```
 
 Quit the menu bar app first. The controller accepts one BLE connection at a time. `tools/` also contains USB and GATT probes and a replay of the console init sequence.
@@ -289,7 +292,7 @@ DSU works on an unsigned build, with no permissions.
 - **No Bluetooth prompt (run from source).** The permission belongs to Terminal or Python. Check `System Settings → Privacy & Security → Bluetooth`, enable Terminal, and relaunch. Wired mode does not need it.
 - **Keyboard bridge does nothing.** It needs Accessibility (`System Settings → Privacy & Security → Accessibility`), and it is off by default. DSU needs neither.
 - **The Switch keeps taking the controller back.** Over Bluetooth the controller keeps advertising, and the console reconnects over BLE (the same radio, not Bluetooth Classic). Power the console fully off, or disable *Wake Console with Controller*. USB avoids this for as long as the cable is plugged in.
-- **Logs.** `~/Library/Logs/Switch2Bridge/bridge.log`. **Capture raw packets** in the menu bar dumps the next 300 raw reports there.
+- **Logs.** `~/Library/Logs/Switch2Bridge/bridge.log`. **Capture raw packets** in the menu bar dumps the next 300 raw reports there. **Log report rate** writes Hz, the inter-report gap, and skipped counters to the same log.
 
 ## Limitations
 
@@ -299,6 +302,7 @@ DSU works on an unsigned build, with no permissions.
 | Analog sticks | Working | Full 12-bit over DSU, factory calibration when the controller answers |
 | C / GL / GR | Decoded | No native DSU slot. Alias them onto a DSU button |
 | Wired USB | Working | 250 Hz after the vendor-interface init. Falls back to BLE if the cable cannot be claimed |
+| Bluetooth rate | ~33 Hz | One report per connection event. Not 250 Hz, and not the console's 200 Hz. See [docs/PROTOCOL.md](docs/PROTOCOL.md) |
 | Keyboard bridge | Optional | Off by default. 8-direction sticks only |
 | Motion / gyro | No gyro support yet | Report `0x09` carries extra bytes. They do not decode as motion. Replaying the console's BLE init sequence did not enable it |
 | Player LEDs | Working | A pattern is sent on connect (player 1 by default, `controller.player_light`) |
@@ -330,6 +334,7 @@ switch2bridge-macos/
 ├── controller_commands.py  # SPI reads and player LEDs
 ├── controller_state.py     # ControllerState and stick calibration
 ├── dsu_server.py           # DSU (Cemuhook) server
+├── report_rate.py          # Arrival rate, gap, and skipped counters
 ├── outputs.py              # Legacy keyboard backend
 ├── docs/PROTOCOL.md        # Hardware-verified protocol notes
 ├── tools/                  # Capture, analysis, and probe scripts

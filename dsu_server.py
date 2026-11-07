@@ -247,10 +247,15 @@ class DSUServer:
     # --- input feed (called from the BLE thread) ---
 
     def push(self, state):
-        """Broadcast one ControllerState to every subscribed DSU client."""
+        """Broadcast one ControllerState to every subscribed DSU client.
+
+        One call sends one datagram per client. There is no timer and no
+        coalescing: the output rate is the rate reports are pushed at.
+        Returns how many clients the datagram was sent to.
+        """
         sock = self._sock
         if sock is None or self._stop.is_set():
-            return
+            return 0
         now = time.monotonic()
         with self._lock:
             stale = [a for a, t in self._clients.items() if now - t > CLIENT_TIMEOUT]
@@ -258,10 +263,13 @@ class DSUServer:
                 del self._clients[a]
             targets = list(self._clients)
         if not targets:
-            return
+            return 0
         pkt = self._data_packet(state)
+        sent = 0
         for addr in targets:
             try:
                 sock.sendto(pkt, addr)
+                sent += 1
             except OSError as e:
                 log.warning("DSU send to %s failed: %s", addr, e)
+        return sent

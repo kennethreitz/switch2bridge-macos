@@ -155,10 +155,11 @@ interval = 15.00 ms   latency = 0   timeout = 2000 ms
 ```
 
 Confirmed independently by packet timing in the same capture — the dominant
-inter-event gap is 14.8 ms. No `LL_CONNECTION_UPDATE_IND` appears anywhere,
-so it never changes after connecting.
+inter-event gap is 14.8 ms. No `LL_CONNECTION_UPDATE_IND` appears anywhere
+in that trace.
 
-macOS negotiates **30 ms** instead: ~33 Hz against the console's ~66 Hz. The
+macOS negotiates **30 ms** instead: ~33 Hz, against the ~66 Hz of that
+capture. A settled console session is 200 Hz, covered in the next section. The
 controller sends exactly one report per connection event on both transports
 — the byte-0 counter increments by 1 every time, over 2454 BLE and 499 USB
 transitions — so the report rate *is* the connection interval. The
@@ -171,7 +172,91 @@ before any command is sent, and CoreBluetooth exposes no API to influence
 it. 15 ms is Apple's documented minimum for peripheral-requested
 parameters, so the controller would likely be granted it — but it publishes
 no Peripheral Preferred Connection Parameters characteristic and never sends
-a connection parameter update request.
+a connection parameter update request. Apple centrals do not read that
+characteristic anyway.
+
+That 15 ms figure is the `CONNECT_IND` in the capture above. A settled
+console session is faster than that, and still nowhere near 250 Hz over
+BLE. See the next section.
+
+## 250 Hz over BLE is not reachable
+
+250 Hz is the USB poll (4 ms). It is not a BLE mode, and it is faster than
+the controller's own wireless link to a Switch 2.
+
+The sample clock is the connection interval. The captures above already
+showed it: the byte-0 counter increments by 1 on every notification, over
+2454 BLE reports and 499 USB reports, so the controller emits one report
+per event and adapts to the link instead of sampling at a fixed 250 Hz and
+dropping the rest. Replaying the console's GATT init left the macOS rate
+at 33 Hz / 30 ms. Nothing in that sequence asks the controller to outrun
+the interval.
+
+What the console actually does, from later public captures, is change the
+interval from the central side:
+
+* A fresh session starts near 15 ms (the `CONNECT_IND` sniffed above,
+  gap 14.8 ms, no standard `LL_CONNECTION_UPDATE_IND` in that trace).
+* A settled session runs at **5 ms / 200 Hz**, one input report per event.
+  Leon's 2026 write-up and the ESP-IDF Switch 2 notes both measure that.
+  The interval value is 4 × 1.25 ms, which is **below the Bluetooth
+  minimum of 7.5 ms**. Spec-compliant stacks (Zephyr, NimBLE) reject it
+  unless patched. ndeadly's notes describe the console applying it with a
+  vendor-specific HCI command, which is why a trace that only looks for
+  `LL_CONNECTION_UPDATE_IND` can miss it, and why the controller never
+  sends the L2CAP connection-parameter update a normal central expects.
+  Home-screen reconnects use 5 ms from the `CONNECT_IND`; a fresh pairing
+  is renegotiated down to 5 ms about a second and a half after subscribe.
+* The console also writes `85 00` to the custom descriptor
+  `679d5510-5a24-4dee-9557-95df80486ecb` (ATT handle `0x0010`, on the
+  input report it actually subscribes to, `…f8`) immediately before
+  enabling notifications. That write is not in the replay above.
+  Projects that send it (joycon2android, PadForge) report that it opens
+  the console's input channel and does **not** raise the report rate
+  above the connection interval. `tools/measure_rate.py
+  --write-rate-descriptor` is the check for this unit. It is not part of
+  the connect path.
+
+macOS will not follow the console down to 5 ms.
+
+* CoreBluetooth has no API for a central app to set the connection
+  interval. Bleak cannot add one. Apple's accessory guidelines say the
+  peripheral must request parameters itself. This controller does not
+  (the console never needed it to).
+* The shortest request Apple documents accepting is 15 ms, and a request
+  for exactly 15 ms may be scaled to 30 ms. 11.25 ms is only for devices
+  that expose HID-over-GATT. This controller does not: it is a proprietary
+  GATT service, and it advertises BR/EDR unsupported.
+* 4 ms is not a legal BLE connection interval (the spec floor is 7.5 ms,
+  133 Hz). Multiple notifications per event would be the only way to beat
+  the interval. Every host that has been measured, including the console
+  at 200 Hz, gets one report per event. The counter steps by 1.
+
+So the rates are:
+
+| Host | Interval | Report rate |
+| --- | --- | --- |
+| This app on macOS, measured earlier in this file | 30 ms | ~33 Hz |
+| Apple's documented floor, if the peripheral asked (it does not) | 15 ms, sometimes scaled back to 30 | ~67 Hz |
+| BLE spec minimum, needs a stack that will negotiate it | 7.5 ms | ~133 Hz |
+| Switch 2 console | 5 ms, below spec, vendor HCI | 200 Hz |
+| USB, this app | 4 ms | 250 Hz |
+
+The DSU server is not the cap. `push()` sends one datagram per report to
+every subscribed client and has no timer. **Log report rate** in the menu
+bar (or `"controller": {"rate_log": true}`) records Hz, the gap, skipped
+counters, and how many of those reports DSU actually forwarded. A skipped
+counter means a report was produced and never delivered. Zero skips with
+a 30 ms gap means the link is the limit and this process kept every
+report. The bridge keeps listening on `…f9`. The console listens on
+`…f8`. Both are still one report per event, so switching characteristics
+does not multiply the rate, and the wired path is untouched.
+
+The 30 ms figure is the hardware measurement above. The 5 ms / 200 Hz
+console figure is from those later public captures, not a new capture
+taken for this note. Confirm the live gap on a Mac with **Log report
+rate**, and the before/after of `tools/measure_rate.py --go
+--write-rate-descriptor`.
 
 Use USB if latency matters: 250 Hz / 4 ms.
 
@@ -201,7 +286,8 @@ throughout, and the console reads input from handle `0x000e`
 
 Replaying this verbatim did **not** make `...f8` or `...fd2` start streaming
 for us, and did not enable motion. `tools/replay_console_init.py` reproduces
-the experiment.
+the experiment. It does not write the `85 00` descriptor documented above;
+`tools/measure_rate.py --write-rate-descriptor` does, off the connect path.
 
 ## Still unsolved
 

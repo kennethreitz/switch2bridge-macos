@@ -1,69 +1,72 @@
-# 🎮 Switch 2 Pro Controller — macOS BLE Bridge
+# Switch 2 Pro Controller for macOS
 
-**The first working Bluetooth LE client for the Nintendo Switch 2 Pro Controller on macOS.**
+A Python menu bar app that connects a Nintendo Switch 2 Pro Controller, **wired or over Bluetooth LE**, and exposes it to emulators as a **real analog gamepad** through the DSU (Cemuhook) protocol. No driver, no kext, and no extra permissions for the default setup.
 
-A Python menubar app that connects to the Switch 2 Pro Controller — **wired or over Bluetooth LE** — and exposes it to emulators as a **real analog gamepad** via the DSU (cemuhook) protocol. No driver, no kext, no permissions.
-
-[![CI](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/mlstr0m/switch2bridge-macos/actions/workflows/ci.yml)
+[![CI](https://github.com/kennethreitz/switch2bridge-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/kennethreitz/switch2bridge-macos/actions/workflows/ci.yml)
 [![macOS](https://img.shields.io/badge/macOS-Ventura%2B-blue?logo=apple)](https://www.apple.com/macos)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-green?logo=python)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
+This is a fork of [mlstr0m/switch2bridge-macos](https://github.com/mlstr0m/switch2bridge-macos). Upstream built the Bluetooth LE client, the menu bar app, and the original DSU server. This fork adds wired USB mode (a hardware-verified init sequence sent to the vendor-class interface, 250 Hz versus about 33 Hz over BLE, and an automatic upgrade to wired when the cable is plugged in), real analog sticks with factory calibration, auto-connect, a bundled libusb, and [protocol notes](docs/PROTOCOL.md).
+
+**No gyro support yet.**
+
 ---
 
-## ⚠️ What This Is (and Isn't)
+## What is DSU?
 
-**This is NOT a system driver.** The controller will not appear in System Settings, and macOS games that use Apple's GameController framework will not see it. See [Why not a real HID device?](#-why-not-a-real-hid-device) for the specific, verified reason.
+DSU (Cemuhook) is a small UDP protocol. This bridge serves controller state on `127.0.0.1:26760`. Emulators and frontends connect as clients: Dolphin, Cemu, Ryujinx, and [RetroVault](https://github.com/kennethreitz/RetroVault).
 
-**This IS:**
-- ✅ A BLE client that reads controller inputs via Bluetooth Low Energy
-- ✅ A **DSU/cemuhook gamepad server** — true analog sticks in Dolphin, Cemu, Ryujinx and any other DSU client
-- ✅ A reference implementation of the Switch 2 Pro Controller BLE protocol
-- ✅ An optional legacy keyboard bridge, for emulators that read only the keyboard
+It is not a system driver. The controller does not appear in System Settings, and games that use Apple's GameController framework will not see it. See [Why not a real HID device?](#why-not-a-real-hid-device).
 
-## 🚀 Features
+## What this is
 
-- ✅ **Real analog gamepad output** — full 12-bit sticks over DSU, no driver needed
-- ✅ **Stick calibration** — resting centre learned per connection, full deflection actually reaches 100%
-- ✅ **Radial deadzone + saturation** — configurable, no cross-shaped dead region on diagonals
-- ✅ **Full button mapping** — all buttons, triggers, D-pad, verified against a real capture
-- ✅ **Grip buttons** — Switch 2 exclusive GL/GR, plus the new C button
-- ✅ **No pairing required** — bypasses macOS Bluetooth limitations
-- ✅ **Wired mode** — 250 Hz / 4 ms over USB, against 33 Hz / 30 ms on Bluetooth
-- ✅ **Auto-connect** — picks up a plugged-in controller at launch, no clicking
-- ✅ **Factory stick calibration** — read from the controller's own flash, per unit
-- ✅ **Auto-reconnect** — if the controller sleeps or drops, the bridge retries
-- ✅ **Zero permissions by default** — DSU needs neither Accessibility nor anything else
-- ✅ **Legacy keyboard bridge** — still there, opt-in, for keyboard-only emulators
-- ✅ **Start at Login** — one click in the menubar (bundled .app, macOS 13+)
-- ✅ **Protocol tools** — capture and analyse raw BLE reports yourself
+- A BLE client that reads controller input over Bluetooth Low Energy
+- A wired USB client: 250 Hz once the init sequence is sent
+- A DSU server with full 12-bit analog sticks for Dolphin, Cemu, Ryujinx, RetroVault, and any other DSU client
+- A reference for the Switch 2 Pro Controller BLE and USB protocols ([docs/PROTOCOL.md](docs/PROTOCOL.md))
+- An optional legacy keyboard bridge, for emulators that read only the keyboard
 
-## 🤔 Why This Exists
+## Features
 
-The Nintendo Switch 2 Pro Controller (Product ID: `0x2069`) doesn't work with macOS natively:
+- **Real analog sticks** over DSU, full 12-bit, with no driver
+- **Factory stick calibration** read from the controller's own flash, per unit, including asymmetric travel
+- **Radial deadzone and saturation**, configurable, so diagonals stay smooth
+- **Full button mapping**: buttons, triggers, D-pad, grip buttons (GL/GR), and the C button
+- **Wired mode**: 250 Hz / 4 ms over USB, against about 33 Hz / 30 ms on Bluetooth
+- **Auto-upgrade to wired** when the cable is plugged in during a Bluetooth session
+- **Auto-connect**: the app watches for a cable or for pairing mode, so there is nothing to click
+- **Bundled libusb** in the `.app`, so the DMG does not need Homebrew
+- **Auto-reconnect** if the controller sleeps or drops
+- **No pairing in System Settings.** macOS does not list the controller
+- **DSU needs no Accessibility permission.** Bluetooth permission is only for a wireless connection
+- **Legacy keyboard bridge**, opt-in, for keyboard-only emulators
+- **Start at Login** in the menu bar (bundled `.app`, macOS 13+)
+- **Protocol tools** for capturing and inspecting raw reports
+
+## Why both transports
+
+The Nintendo Switch 2 Pro Controller (vendor `0x057E`, product `0x2069`) does not work with macOS's built-in gamepad support:
 
 | Method | Status | Notes |
 |--------|--------|-------|
-| USB | ✅ | Enumerates, but stays silent until an init sequence is sent to its **vendor-class interface** — not the HID one. This project does that: 250 Hz, 4 ms |
-| Bluetooth Classic | ❌ | macOS can't discover or pair with it |
-| Bluetooth LE | ✅ | Works with a custom BLE client. 33 Hz, 30 ms connection interval |
+| USB | Works | Enumerates, then stays silent until an init sequence is sent to its **vendor-class interface** (interface 1), not the HID interface. This app does that: 250 Hz, 4 ms |
+| Bluetooth Classic | Not available | The controller advertises BR/EDR as unsupported. It is BLE only |
+| Bluetooth LE | Works | Custom BLE client. About 33 Hz, because macOS negotiates a 30 ms connection interval and CoreBluetooth does not let an app change it |
 
-Wired is used automatically when the cable is plugged in, since it is ~7×
-faster and the console cannot steal the controller back over Bluetooth
-Classic while it is wired. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
+Wired is preferred when the cable is plugged in. It is about 7x the Bluetooth rate, and a nearby console cannot take the controller back while it is wired. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
-## 📋 Requirements
+## Requirements
 
 - macOS Ventura (13.0) or later
 - Python 3.9+
 - Nintendo Switch 2 Pro Controller
-- For wired mode from source: `brew install libusb` (the bundled `.app`
-  ships its own copy, so the DMG needs nothing extra)
+- For wired mode from source: `brew install libusb` (the bundled `.app` ships its own copy, so the DMG needs nothing extra)
 
-## 🔧 Run from source
+## Run from source
 
 ```bash
-git clone https://github.com/mlstr0m/switch2bridge-macos.git
+git clone https://github.com/kennethreitz/switch2bridge-macos.git
 cd switch2bridge-macos
 
 python3 -m venv venv
@@ -73,11 +76,11 @@ pip install -r requirements.txt
 python Switch2Bridge.py
 ```
 
-macOS will ask for **Bluetooth** permission the first time you click **Connect Controller** (not at launch). That is the only permission the default configuration needs.
+macOS asks for **Bluetooth** permission the first time a wireless connection needs it, not at launch. A plugged-in controller does not need that permission. That is the only permission the default configuration needs.
 
-⚠️ **When running from source, the Bluetooth permission belongs to _Terminal_ (or your Python interpreter), not to the app.** If no prompt ever appears, add/enable Terminal manually in `System Settings → Privacy & Security → Bluetooth`, then relaunch. The app detects a denied permission and offers to open the right settings pane.
+When running from source, the Bluetooth permission belongs to **Terminal** (or your Python interpreter), not to a separate app. If no prompt ever appears, enable Terminal in `System Settings → Privacy & Security → Bluetooth`, then relaunch. The app detects a denied permission and offers to open that pane.
 
-## 📦 Build a standalone .app + DMG
+## Build a standalone .app and DMG
 
 ```bash
 chmod +x build_dmg.sh
@@ -88,26 +91,29 @@ The installer lands at `dist/Switch2Bridge-Installer.dmg`. Manual build:
 
 ```bash
 python setup_app.py py2app
-# → dist/Switch2 Bridge.app
+# dist/Switch2 Bridge.app
 ```
 
-## 🎯 Usage
+`setup_app.py` copies libusb into the bundle so wired mode works on machines without Homebrew.
 
-1. Launch the app — a 🎮 appears in the menu bar
-2. **Plugged in?** It connects by itself within a second
-   **Wireless?** Click **Connect Controller**, then hold the pair button on the
-   back until the LEDs sweep
-3. Wait for 🟢 (connected). The DSU server is already listening on `127.0.0.1:26760`
-4. Point your emulator at it:
+## Usage
 
-| Emulator | Where |
-|----------|-------|
+1. Launch the app. A gamepad icon appears in the menu bar and the app waits for a controller.
+2. Plug in the USB cable, or hold the pair button on the back until the LEDs sweep. It connects on its own.
+3. Wait for the green icon. The DSU server is already listening on `127.0.0.1:26760`.
+4. Point your emulator or frontend at it:
+
+| Client | Where |
+|--------|-------|
 | **Dolphin** | Options → Controller Settings → *Alternate Input Sources* → enable *DSU Client*, add `127.0.0.1:26760` |
 | **Cemu** | Input settings → add a *DSUController* with the same address |
-| **Ryujinx** | Settings → Input → add controller; enable *Motion* → *Use CemuHook compatible motion* for gyro |
-| **citra / others** | Any client that speaks cemuhook works |
+| **Ryujinx** | Settings → Input → add a controller pointed at the DSU server. No gyro support yet. |
+| **RetroVault** | Connect as a DSU client to `127.0.0.1:26760` ([RetroVault](https://github.com/kennethreitz/RetroVault)) |
+| **citra / others** | Any client that speaks Cemuhook |
 
-The menubar shows how many DSU clients are connected, so you can tell at a glance whether the emulator actually attached.
+The menu bar shows how many DSU clients are connected, so you can tell whether the emulator actually attached.
+
+**Disconnect** stops watching for that session. Relaunch the app, or click **Connect Controller**, to start again.
 
 ### DSU button layout
 
@@ -122,7 +128,7 @@ Mapping is positional, matching a Switch Pro Controller against the DSU (DualSho
 | L / R | L1 / R1 | | LS / RS | L3 / R3 |
 | ZL / ZR | L2 / R2 | | D-Pad | D-Pad |
 
-DSU has exactly 16 button slots and no room for the Switch 2's **GL**, **GR** and **C** buttons. Fold them onto a DSU button if you want them:
+DSU has exactly 16 button slots and no room for the Switch 2's **GL**, **GR**, and **C** buttons. Fold them onto a DSU button if you want them:
 
 ```json
 "dsu": { "aliases": { "GL": "L", "GR": "R", "C": "HOME" } }
@@ -130,22 +136,25 @@ DSU has exactly 16 button slots and no room for the Switch 2's **GL**, **GR** an
 
 ### Stick tuning
 
+On connect the app reads factory calibration from the controller (left block `0x000130A8`, right block `0x000130E8`). That supplies the real centre and the travel in each direction. If the read fails, it falls back to learning the resting centre from the first quiet reports.
+
 ```json
 "sticks": {
   "deadzone": 0.08,
   "saturation": 0.95,
-  "calibration": { "auto_center": true, "half_range": 1500 }
+  "calibration": { "auto_center": true, "half_range": 1500, "use_factory": true }
 }
 ```
 
-- **deadzone** — radial, applied to stick magnitude (not per axis, so diagonals stay smooth)
-- **saturation** — deflection treated as "fully pushed"; everything beyond clamps to 1.0
-- **auto_center** — learns the resting position over the first 60 reports of each connection, and refuses to calibrate if a stick was being moved. **Recalibrate sticks** in the menubar re-runs it
-- **half_range** — raw counts from centre to full deflection
+- **deadzone**: radial, applied to stick magnitude, so diagonals stay smooth
+- **saturation**: deflection treated as fully pushed; everything beyond clamps to 1.0
+- **auto_center**: learns the resting position over the first 60 reports of a connection when factory data is not in use, and refuses to calibrate if a stick was moving
+- **half_range**: raw counts from centre to full deflection, used until factory travel is applied
+- **use_factory**: read per-unit calibration from the controller. **Recalibrate sticks** re-learns the centre and keeps factory travel
 
-## ⌨️ Legacy keyboard bridge (optional, off by default)
+## Legacy keyboard bridge (optional, off by default)
 
-The original keyboard bridge is still available for emulators that read only the keyboard. It costs an **Accessibility** grant and reduces the analog sticks to 8 thresholded directions, so it is disabled unless you turn it on from the menubar (**Keyboard bridge**) or in `mappings.json`:
+The original keyboard bridge is still available for emulators that read only the keyboard. It needs an **Accessibility** grant and reduces the analog sticks to 8 thresholded directions, so it stays off unless you enable **Keyboard bridge** in the menu bar or set this in `mappings.json`:
 
 ```json
 "keyboard": { "enabled": true }
@@ -166,11 +175,11 @@ Default mapping:
 
 D-Pad is mapped to the arrow keys, left stick to WASD, right stick to IJKL.
 
-Each value is either a single character (`"a"`, `"5"`, `"."`), `null` to leave a button unmapped, or a named key in angle brackets: `<up>`, `<down>`, `<left>`, `<right>`, `<space>`, `<enter>`, `<esc>`, `<tab>`, `<backspace>`, `<delete>`, `<home>`, `<end>`, `<pageup>`, `<pagedown>`, `<shift>`, `<ctrl>`, `<alt>`, `<cmd>`, and `<f1>` … `<f20>`.
+Each value is a single character (`"a"`, `"5"`, `"."`), `null` to leave a button unmapped, or a named key in angle brackets: `<up>`, `<down>`, `<left>`, `<right>`, `<space>`, `<enter>`, `<esc>`, `<tab>`, `<backspace>`, `<delete>`, `<home>`, `<end>`, `<pageup>`, `<pagedown>`, `<shift>`, `<ctrl>`, `<alt>`, `<cmd>`, and `<f1>` through `<f20>`.
 
-Two inputs may share the same key: the key is only released once both are released.
+Two inputs may share the same key. The key is released only once both are released.
 
-## 🛠️ Configuration
+## Configuration
 
 The first launch writes a JSON config to:
 
@@ -178,164 +187,165 @@ The first launch writes a JSON config to:
 ~/Library/Application Support/Switch2Bridge/mappings.json
 ```
 
-Edit it, then **Reload mappings** from the menubar. Invalid JSON falls back to defaults and the menubar surfaces the parse error; typos in button names or stick directions are reported via a notification rather than silently ignored.
+Edit it, then choose **Reload mappings** in the menu bar. Invalid JSON falls back to defaults and the menu bar shows the parse error. Typos in button names or stick directions are reported in a notification.
 
-Upgrading from an older version migrates the file in place, adding only the missing blocks — your existing edits are preserved. Note that **the migration leaves the keyboard bridge off**; re-enable it from the menubar if you need it.
+Upgrading from an older version migrates the file in place and adds only the missing blocks. Existing edits are preserved. The migration leaves the keyboard bridge off. Re-enable it from the menu bar if you need it.
 
-## 🔬 How It Works
+## How it works
 
 ```
-┌─────────────────┐    BLE     ┌──────────────────┐    DSU/UDP    ┌─────────────┐
-│  Switch 2 Pro   │ ─────────▶ │  ControllerState │ ────────────▶ │  Emulator   │
-│   Controller    │  (bleak)   │   (decoded once) │  (analog)     │             │
-└─────────────────┘            └──────────────────┘               └─────────────┘
-                                        │
-                                        │  optional, opt-in
-                                        └──────────────▶  keyboard (pynput)
+┌─────────────────┐  USB or BLE  ┌──────────────────┐   DSU/UDP    ┌─────────────┐
+│  Switch 2 Pro   │ ───────────▶ │  ControllerState │ ───────────▶ │  Emulator   │
+│   Controller    │              │  (decoded once)  │   (analog)   │  or frontend│
+└─────────────────┘              └──────────────────┘              └─────────────┘
+                                          │
+                                          │  optional, opt-in
+                                          └──────────────▶  keyboard (pynput)
 ```
 
-The BLE report is decoded exactly once into a neutral `ControllerState`, which every output backend renders its own way. Adding a backend does not touch the parser.
+USB is read with hidapi after libusb sends the init sequence to vendor interface 1. Bluetooth uses bleak. Either way the report is decoded once into a neutral `ControllerState`, and each output renders it. Adding a backend does not touch the parser.
+
+Wired init, in order, on bulk endpoint `0x02`:
+
+```
+03 91 00 0D ...   init (an all-FF host address is accepted)
+0C 91 00 02 ...   feature mask
+0C 91 00 04 ...   enable features
+03 91 00 0A ...   select input report 0x09
+```
+
+The byte sequences follow public notes (see Credits). What this project established on hardware is that those commands have to go to the vendor-class interface. The same bytes sent as HID output reports are accepted and do nothing. Details, including the console's own BLE init sequence, are in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ### BLE characteristics
 
-The controller exposes two services and 16 characteristics. Run
-`tools/gatt_explore.py` for the full tree.
+The controller exposes two services and 16 characteristics. Run `tools/gatt_explore.py` for the full tree. The bridge uses three of them:
 
 | UUID | Properties | Purpose |
 |------|-----------|---------|
-| `7492866c-…f9` | read, notify | Input reports — the only channel the bridge uses |
-| `7492866c-…f8` | read, notify | A **second notification channel**, contents unknown |
+| `7492866c-…f9` | read, notify | Input reports |
+| `649d4ac9-…f005` | write without response | Command channel: factory calibration reads and player LEDs |
+| `c765a961-…836a` | notify | Replies to those commands |
+| `7492866c-…f8` | read, notify | Second input channel. The console reads this one. This bridge does not |
 | `ab7de9be-…fd2`, `…fde` | read, notify | Unknown notification channels |
-| `c765a961-…836a` | notify | Unknown; carries a different descriptor class |
-| `506d9f7d-…57e0` | notify | Unknown; same class as above |
-| `d3bd69d2-…2a80` | notify | Unknown; same class as above |
-| `00c5af5d-…bd282` | **write** (with response) | Only ACK'd write endpoint — likely the command channel |
-| `cc483f51-…2b05`/`…2b06` | write-without-response | Unknown write endpoints |
-| `3dacbc7e-…b379`/`…b380` | write-without-response | Unknown write endpoints |
-| `649d4ac9-…f005`, `4147423d-…f98d`, `ab7de9be-…fdf` | write-without-response | Unknown write endpoints |
+| `ab7de9be-…fdf` | write without response | Unknown |
+| `506d9f7d-…57e0` | notify | Unknown |
+| `d3bd69d2-…2a80` | notify | Unknown |
+| `00c5af5d-…bd282` | write with response | Unused by the bridge |
+| `cc483f51-…2b05` / `…2b06` | write without response | Unknown |
+| `3dacbc7e-…b379` | write without response | Same commands as `649d4ac9-…f005`, with 33 leading zero bytes. Unused here |
+| `3dacbc7e-…b380` | write without response | Unknown |
+| `4147423d-…f98d` | write without response | Unknown |
 
-> Earlier versions of this README listed `7492866c-…f8` as the output
-> characteristic for LED and rumble. **That is wrong** — it is notify-only
-> and cannot be written to, which is why "output doesn't respond". The real
-> write endpoints are the eight listed above, none of which the bridge
-> currently uses.
+`7492866c-…f8` is notify-only. It is not an LED or rumble output.
 
 ### Input report layout
 
-Reports are **112 bytes**, of which only the first 12 carry anything (verified over a 2,455-packet capture):
+The bridge decodes the first 12 bytes below. USB prepends a HID report ID, and that byte is stripped before this layout. Report `0x09` (what wired mode selects) continues past byte 11. Those extra bytes are not used. No gyro support yet.
 
 | Byte | Contents |
 |------|----------|
 | 0 | Free-running counter |
-| 1 | Constant `0x1f` |
-| 2 | `B` `A` `Y` `X` `R` `ZR` `+` `RS` (bits 0x01…0x80) |
+| 1 | Constant `0x1f` on the basic report, `0x23` when report `0x09` is selected |
+| 2 | `B` `A` `Y` `X` `R` `ZR` `+` `RS` (bits 0x01 through 0x80) |
 | 3 | `DDOWN` `DRIGHT` `DLEFT` `DUP` `L` `ZL` `−` `LS` |
 | 4 | `HOME` 0x01, `CAPT` 0x02, `GR` 0x04, `GL` 0x08, `C` 0x10 |
-| 5–7 | Left stick, two 12-bit values |
-| 8–10 | Right stick, two 12-bit values |
+| 5-7 | Left stick, two 12-bit values |
+| 8-10 | Right stick, two 12-bit values |
 | 11 | Constant `0x30` |
-| 12–111 | Always zero in every capture so far |
 
-> Earlier versions had **C and CAPT swapped** (`0x02` was read as C, `0x10` as Capture). Fixed in v1.3.0 and confirmed live.
+An earlier layout had **C and CAPT swapped** (`0x02` read as C, `0x10` as Capture). The table above matches a live capture and the BlueRetro button map.
 
 ### Protocol tools
 
 ```bash
-python3 tools/capture_packets.py     # guided capture → capture.jsonl
+python3 tools/capture_packets.py     # guided capture, writes capture.jsonl
 python3 tools/analyze_capture.py     # per-byte variance, button bits, stick extents
-python3 tools/live_buttons.py        # live view of which bits are set as you press
+python3 tools/live_buttons.py        # which bits are set as you press
+python3 tools/read_calibration.py    # factory stick blocks over BLE
 ```
 
-Quit the menubar app first — the controller accepts one BLE connection at a time.
+Quit the menu bar app first. The controller accepts one BLE connection at a time. `tools/` also contains USB and GATT probes and a replay of the console init sequence.
 
-## 🧊 Why not a real HID device?
+## Why not a real HID device?
 
-Making the controller appear as a genuine system-wide gamepad requires creating a virtual HID device, which on macOS is gated behind an Apple-**restricted** entitlement. This was tested directly on macOS 27 with SIP enabled:
+Making the controller appear as a system-wide gamepad means creating a virtual HID device. On macOS that needs an Apple-restricted entitlement. This was tested on macOS 27 with SIP enabled:
 
 | Attempt | Result |
 |---------|--------|
-| `IOHIDUserDeviceCreate` symbols present in IOKit | ✅ present |
-| Create a virtual gamepad, unentitled | ❌ returns `NULL` |
-| Same, ad-hoc signed with `com.apple.developer.hid.virtual.device` | ❌ process **SIGKILLed** by AMFI |
+| `IOHIDUserDeviceCreate` symbols present in IOKit | Present |
+| Create a virtual gamepad, unentitled | Returns `NULL` |
+| Same, ad-hoc signed with `com.apple.developer.hid.virtual.device` | Process is killed by AMFI |
 
-Ad-hoc signing the entitlement doesn't merely fail — the kernel kills the process. Obtaining it legitimately needs an Apple Developer Program **organization** account, a per-request approval from Apple, and a notarized build; the DriverKit route (`com.apple.developer.driverkit.family.hid.device`) has the same gate. The only other way through is disabling AMFI/SIP.
+Ad-hoc signing that entitlement gets the process killed. Obtaining it needs an Apple Developer Program organization account, a per-request approval from Apple, and a notarized build. The DriverKit route (`com.apple.developer.driverkit.family.hid.device`) has the same gate. The other route is disabling AMFI or SIP.
 
-DSU is the path that works today, on an unsigned build, with no permissions.
+DSU works on an unsigned build, with no permissions.
 
-## 🩺 Troubleshooting
+## Troubleshooting
 
-- **The controller never appears in System Settings → Bluetooth** — that's **expected**, and not a failure. This bridge is a BLE client: there is no system-level pairing, so macOS will never list the controller. The only place to watch is the app's menubar icon (🔍 → 🟢).
-- **"Controller not found"** — make sure the controller is **not paired with a console nearby** (unpair it or put the console to sleep far away). Click **Connect Controller** *first* — the search runs for 30 s — *then* hold the small pair button on the back until the LEDs sweep back and forth.
-- **Menubar says 🟢 but the emulator sees nothing** — check the DSU client count in the menubar. If it's 0, the emulator never attached: re-check the host/port in its DSU settings.
-- **Sticks drift** — click **Recalibrate sticks** with both sticks released.
-- **No Bluetooth prompt ever appeared (run-from-source)** — the permission belongs to Terminal/Python, not the app. Check `System Settings → Privacy & Security → Bluetooth` and enable Terminal, then relaunch.
-- **Keyboard bridge does nothing** — it needs Accessibility (`System Settings → Privacy & Security → Accessibility`), and it's off by default. DSU needs neither.
-- **The Switch keeps stealing the controller back** — the bridge connects over **BLE**, while the console uses **Bluetooth Classic**; the controller happily holds both. Because the bridge never sends a claim command, the controller stays in pairing mode and answers the console. Until the command protocol is worked out, fully **power off** the console (sleep is not enough) or disable *Wake Console with Controller* in its controller settings.
-- **Logs** — written to `~/Library/Logs/Switch2Bridge/bridge.log`. **Capture raw packets** in the menubar dumps the next 300 raw reports there.
+- **The controller never appears in System Settings → Bluetooth.** That is expected. There is no system-level pairing, so macOS will not list it. Watch the menu bar icon.
+- **It stays on "Waiting for controller..."** Plug the cable in, or hold the small pair button on the back until the LEDs sweep. A nearby console that is already using the controller will keep it. Power the console off (sleep is not enough) or move it away. **Connect Controller** is the manual search (30 seconds) for when auto-connect is off.
+- **Green icon, but the emulator sees nothing.** Check the DSU client count in the menu bar. Zero means the emulator never attached. Recheck host and port.
+- **Sticks drift.** Click **Recalibrate sticks** with both sticks released.
+- **No Bluetooth prompt (run from source).** The permission belongs to Terminal or Python. Check `System Settings → Privacy & Security → Bluetooth`, enable Terminal, and relaunch. Wired mode does not need it.
+- **Keyboard bridge does nothing.** It needs Accessibility (`System Settings → Privacy & Security → Accessibility`), and it is off by default. DSU needs neither.
+- **The Switch keeps taking the controller back.** Over Bluetooth the controller keeps advertising, and the console reconnects over BLE (the same radio, not Bluetooth Classic). Power the console fully off, or disable *Wake Console with Controller*. USB avoids this for as long as the cable is plugged in.
+- **Logs.** `~/Library/Logs/Switch2Bridge/bridge.log`. **Capture raw packets** in the menu bar dumps the next 300 raw reports there.
 
-## 🚧 Limitations
+## Limitations
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Buttons | ✅ Working | All buttons verified against a real capture |
-| Analog sticks | ✅ Working | Full 12-bit analog over DSU, calibrated |
-| C / GL / GR | ✅ Decoded | No native DSU slot — alias them onto a DSU button |
-| Keyboard bridge | ✅ Optional | Off by default; 8-direction sticks only |
-| Motion / Gyro | ❌ Not available | Bytes 12–111 of the input report are zero in every capture. Either the IMU needs enabling via a write endpoint, or it streams on one of the six unsubscribed notify channels. Plumbing and configurable offsets exist — see `motion` in `mappings.json` |
-| LED control | ❌ Not working | No command has been sent yet — the bridge writes nothing at all |
-| Rumble | ❌ Not working | Same cause |
-| Battery level | ❌ Not decoded | Not located in the report yet |
-| **Exiting pairing mode** | ❌ Not working | The bridge never claims the controller, so it keeps advertising and a nearby Switch will reconnect to it over Bluetooth Classic. See below |
-| Native HID | ❌ Not possible | Requires an Apple-restricted entitlement — see above |
+| Buttons | Working | Verified against a real capture |
+| Analog sticks | Working | Full 12-bit over DSU, factory calibration when the controller answers |
+| C / GL / GR | Decoded | No native DSU slot. Alias them onto a DSU button |
+| Wired USB | Working | 250 Hz after the vendor-interface init. Falls back to BLE if the cable cannot be claimed |
+| Keyboard bridge | Optional | Off by default. 8-direction sticks only |
+| Motion / gyro | No gyro support yet | Report `0x09` carries extra bytes. They do not decode as motion. Replaying the console's BLE init sequence did not enable it |
+| Player LEDs | Working | A pattern is sent on connect (player 1 by default, `controller.player_light`) |
+| Rumble | Not implemented | |
+| Battery level | Not decoded | Not located in the report |
+| Leaving pairing mode on BLE | Not solved | The controller keeps advertising, so a nearby Switch can reconnect. USB sidesteps this |
+| Native HID | Not possible | Needs an Apple-restricted entitlement. See above |
 
-## 🤝 Contributing
+## Contributing
 
-Contributions welcome! Areas that need work:
+The command channel used here is `649d4ac9-…f005`, with replies on `c765a961-…836a`. Factory stick reads and player LEDs already go out on it.
 
-The big open problem is the **command protocol**. The bridge has never written a
-single byte to the controller, and that one gap plausibly explains the missing
-motion data, the dead LEDs, and the fact that the controller never leaves
-pairing mode. There are eight unused write endpoints (see the characteristic
-table) and six unsubscribed notify channels where a reply would land.
+Still open, in roughly this order:
 
-1. **Map the command channel** — `00c5af5d-…bd282` is the only write-with-response
-   endpoint, which makes it the best candidate. `tools/listen_all.py` subscribes
-   to every notify channel so a response can be spotted
-2. **Enable the IMU** — likely the same protocol; may also already be streaming
-   on an unsubscribed channel
-3. **LED / rumble / exiting pairing mode** — same protocol
-4. **Battery level** — locate it in the report
-5. **Cross-platform** — Linux (`uinput` gives a real HID device for free) / Windows (ViGEm)
+1. **Gyro.** No gyro support yet. The extra bytes in report `0x09` do not track motion in the captures so far, and replaying the console init sequence did not turn it on.
+2. **Rumble.**
+3. **Battery level** in the input report.
+4. **Stop advertising after connect**, so a console cannot reclaim the controller over BLE. USB already avoids that.
+5. **Other platforms.** Linux `uinput` can be a real HID device. Windows has ViGEm.
 
-⚠️ When probing write endpoints, be aware that one of them may be a firmware or
-configuration endpoint. Prefer short, structured probes over random payloads.
+When probing write endpoints, one of them may be a firmware or configuration endpoint. Prefer short, structured probes over random payloads.
 
-## 📁 Project Structure
+## Project structure
 
 ```
 switch2bridge-macos/
-├── Switch2Bridge.py       # Menubar app, BLE client, report decoding
-├── controller_state.py    # Neutral ControllerState + stick calibration
-├── outputs.py             # KeyboardOutput (legacy backend)
-├── dsu_server.py          # DSU (cemuhook) server — the primary backend
-├── tools/
-│   ├── capture_packets.py # Guided raw-report capture
-│   ├── analyze_capture.py # Offline layout analysis
-│   └── live_buttons.py    # Live button-bit viewer
-├── tests/
-│   ├── test_state.py      # Calibration, migration, motion decode
-│   ├── test_bridge.py     # Mappings, key dispatch, BLE lifecycle
-│   └── test_dsu.py        # DSU protocol over real UDP
-├── setup_app.py           # py2app configuration
-├── build_dmg.sh           # Automated build script (.app + DMG)
-└── requirements.txt
+├── Switch2Bridge.py        # Menu bar app, connect loop, report decoding
+├── usb_transport.py        # Wired mode: libusb init, 250 Hz input
+├── controller_commands.py  # SPI reads and player LEDs
+├── controller_state.py     # ControllerState and stick calibration
+├── dsu_server.py           # DSU (Cemuhook) server
+├── outputs.py              # Legacy keyboard backend
+├── docs/PROTOCOL.md        # Hardware-verified protocol notes
+├── tools/                  # Capture, analysis, and probe scripts
+├── tests/                  # Headless tests for state, the bridge, and DSU
+├── setup_app.py            # py2app configuration, including bundled libusb
+├── build_dmg.sh            # .app and DMG
+├── requirements.txt
+└── AppIcon.icns
 ```
 
-## 📜 Credits
+## Credits
 
-- **Aurélien Desert** — reverse engineering & implementation
+- **[mlstr0m/switch2bridge-macos](https://github.com/mlstr0m/switch2bridge-macos)** (Aurélien Desert): the Bluetooth LE client, the menu bar app, and the original DSU server
+- **[darthcloud/BlueRetro #1249](https://github.com/darthcloud/BlueRetro/issues/1249)** and **[@german77](https://github.com/german77)**: ATT table, command framing, SPI reads, and the stick calibration layout
+- **[TommyWabg/Switch2Connect](https://github.com/TommyWabg/Switch2Connect)** (GPL-3.0): the USB init byte sequences, used here as a protocol reference and checked on hardware
 
-## 📚 Protocol notes
+## Protocol notes
 
-See [docs/PROTOCOL.md](docs/PROTOCOL.md) for hardware-verified findings on the
-BLE and USB protocols, stick calibration, and what is still unsolved.
+[docs/PROTOCOL.md](docs/PROTOCOL.md) records what was verified on a real Pro Controller 2: factory calibration addresses, the USB interface map, why Bluetooth stays near 33 Hz, the console's BLE init sequence, and what is still unsolved.
